@@ -2,12 +2,18 @@ import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals
 
 type QueryResult = { rows: Record<string, unknown>[]; rowCount: number };
 const mockQuery = jest.fn<(sql: string, params?: unknown[]) => Promise<QueryResult>>();
+const mockClientQuery = jest.fn<(sql: string, params?: unknown[]) => Promise<QueryResult>>();
+const mockWithTransaction = jest.fn(
+  async (callback: (client: { query: typeof mockClientQuery }) => Promise<unknown>) =>
+    callback({ query: mockClientQuery }),
+);
 const mockSendGridMail = { setApiKey: jest.fn(), send: jest.fn() };
 const mockTwilioMessagesCreate = jest.fn();
 const mockTwilioFactory = jest.fn(() => ({ messages: { create: mockTwilioMessagesCreate } }));
 
 jest.unstable_mockModule('../../db/connection.js', () => ({
   query: mockQuery,
+  withTransaction: mockWithTransaction,
 }));
 
 jest.unstable_mockModule('twilio', () => ({
@@ -18,11 +24,15 @@ jest.unstable_mockModule('@sendgrid/mail', () => ({
   default: mockSendGridMail,
 }));
 
-const { notificationService } = await import('../notificationService.js');
+const {
+  notificationService,
+  getNotificationRetryDelayMs,
+} = await import('../notificationService.js');
 
 describe('notificationService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockTwilioMessagesCreate.mockResolvedValue({ sid: 'SM-message-id' });
     process.env.FROM_EMAIL = 'noreply@remitlend.test';
     process.env.SENDGRID_API_KEY = 'test-sendgrid-key';
     process.env.TWILIO_ACCOUNT_SID = 'ACtest123';
@@ -36,6 +46,147 @@ describe('notificationService', () => {
     delete process.env.TWILIO_ACCOUNT_SID;
     delete process.env.TWILIO_AUTH_TOKEN;
     delete process.env.TWILIO_PHONE_NUMBER;
+  });
+
+  describe('notification delivery lifecycle', () => {
+    it('uses bounded jittered retry delays and retries accepted failure idempotently', async () => {
+      expect(getNotificationRetryDelayMs(1, () => 0)).toBe(15_000);
+      expect(getNotificationRetryDelayMs(4, () => 1)).toBe(2_700_000);
+      expect(getNotificationRetryDelayMs(99, () => 1)).toBe(2_700_000);
+
+      let attemptStatus = 'accepted';
+      mockClientQuery.mockImplementation(async (sql) => {
+        if (sql.includes('FROM notification_delivery_attempts')) {
+          return {
+            rows: [
+              {
+                id: 'delivery-1',
+                channel: 'sms',
+                status: 'accepted',
+                attempt_id: 'attempt-1',
+                attempt_status: attemptStatus,
+                notification_created_at: new Date(Date.now() - 10_000),
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (sql.includes('UPDATE notification_delivery_attempts')) {
+          attemptStatus = 'delivered';
+        }
+        return { rows: [], rowCount: 1 };
+      });
+
+      const receipt = {
+        provider: 'twilio' as const,
+        providerMessageId: 'SM-message-id',
+        status: 'delivered' as const,
+      };
+      await expect(notificationService.recordProviderReceipt(receipt)).resolves.toBe(true);
+      await expect(notificationService.recordProviderReceipt(receipt)).resolves.toBe(true);
+
+      expect(
+        mockClientQuery.mock.calls.filter(([sql]) =>
+          sql.includes('UPDATE notification_delivery_attempts'),
+        ),
+      ).toHaveLength(1);
+    });
+
+    it('classifies a provider timeout and exhausts retries without PII diagnostics', async () => {
+      mockTwilioMessagesCreate.mockRejectedValue(
+        Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }),
+      );
+      mockQuery
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              id: 'delivery-2',
+              notification_id: 9,
+              channel: 'sms',
+              provider: 'twilio',
+              attempt_count: 5,
+            },
+          ],
+          rowCount: 1,
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              user_id: 'user-retry',
+              type: 'repayment_due',
+              message: 'Private repayment text',
+              email_enabled: false,
+              sms_enabled: true,
+              phone: '+15557654321',
+            },
+          ],
+          rowCount: 1,
+        })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+      await notificationService.processDeliveryRetries();
+
+      expect(mockQuery.mock.calls[3]?.[0]).toContain('INSERT INTO notification_delivery_attempts');
+      expect(mockQuery.mock.calls[3]?.[1]).toEqual([
+        'delivery-2',
+        5,
+        'twilio',
+        null,
+        'permanent_failure',
+        'RETRY_EXHAUSTED',
+      ]);
+      expect(mockQuery.mock.calls[4]?.[1]?.[2]).toBe('permanent_failure');
+      expect(mockQuery.mock.calls[4]?.[1]?.[3]).toBe('RETRY_EXHAUSTED');
+      expect(JSON.stringify(mockQuery.mock.calls)).not.toContain('+15557654321');
+      expect(JSON.stringify(mockQuery.mock.calls)).not.toContain('Private repayment text');
+    });
+
+    it('retries after provider recovery and records its new message identifier', async () => {
+      mockQuery
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              id: 'delivery-3',
+              notification_id: 11,
+              channel: 'sms',
+              provider: 'twilio',
+              attempt_count: 2,
+            },
+          ],
+          rowCount: 1,
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              user_id: 'user-recovered',
+              type: 'repayment_due',
+              message: 'Repayment reminder',
+              email_enabled: false,
+              sms_enabled: true,
+              phone: '+15550001111',
+            },
+          ],
+          rowCount: 1,
+        })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+      await notificationService.processDeliveryRetries();
+
+      expect(mockTwilioMessagesCreate).toHaveBeenCalledTimes(1);
+      expect(mockQuery.mock.calls[3]?.[1]).toEqual([
+        'delivery-3',
+        2,
+        'twilio',
+        'SM-message-id',
+        'accepted',
+        null,
+      ]);
+      expect(mockQuery.mock.calls[4]?.[1]?.[2]).toBe('accepted');
+    });
   });
 
   describe('createNotification', () => {
@@ -276,7 +427,15 @@ describe('notificationService', () => {
             },
           ],
           rowCount: 1,
-        });
+        })
+        .mockResolvedValueOnce({ rows: [{ id: 'email-delivery' }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [{ attempt_count: 1 }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [{ id: 'sms-delivery' }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [{ attempt_count: 1 }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 });
 
       await notificationService.createNotification({
         userId: 'user-delivery-1',
@@ -332,7 +491,11 @@ describe('notificationService', () => {
             },
           ],
           rowCount: 1,
-        });
+        })
+        .mockResolvedValueOnce({ rows: [{ id: 'email-delivery' }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [{ attempt_count: 1 }], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 });
 
       await notificationService.createNotification({
         userId: 'user-template-1',

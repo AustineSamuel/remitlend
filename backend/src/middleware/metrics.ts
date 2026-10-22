@@ -61,6 +61,21 @@ export const webhookRetryQueueDepthGauge = new client.Gauge({
   registers: [metricsRegistry],
 });
 
+export const notificationDeliveryFailuresCounter = new client.Counter({
+  name: 'notification_delivery_failures_total',
+  help: 'Notification provider delivery failures by bounded channel, provider, and failure class.',
+  labelNames: ['channel', 'provider', 'failure_class'] as const,
+  registers: [metricsRegistry],
+});
+
+export const notificationDeliveryLagHistogram = new client.Histogram({
+  name: 'notification_delivery_lag_seconds',
+  help: 'Time from notification creation to provider-confirmed delivery.',
+  labelNames: ['channel', 'provider'] as const,
+  buckets: [1, 5, 15, 30, 60, 300, 900, 3600, 21600],
+  registers: [metricsRegistry],
+});
+
 export const scoreReconciliationLastRunTimestampGauge = new client.Gauge({
   name: 'score_reconciliation_last_run_timestamp',
   help: 'Unix timestamp in seconds for the last score reconciliation run.',

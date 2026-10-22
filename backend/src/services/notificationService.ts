@@ -1,6 +1,10 @@
-import { query } from '../db/connection.js';
+import { query, withTransaction } from '../db/connection.js';
 import logger from '../utils/logger.js';
 import type { Response } from 'express';
+import {
+  notificationDeliveryFailuresCounter,
+  notificationDeliveryLagHistogram,
+} from '../middleware/metrics.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -109,67 +113,114 @@ function buildEmailTemplate(
   return templates[type];
 }
 
-async function sendEmail(email: string, message: string, type?: NotificationType): Promise<void> {
+type NotificationChannel = 'email' | 'sms';
+type FailureClass = 'retryable' | 'permanent';
+
+interface ProviderOutcome {
+  status: 'accepted' | 'retryable_failure' | 'permanent_failure';
+  provider: 'sendgrid' | 'twilio';
+  providerMessageId?: string;
+  errorCode?: string;
+}
+
+function classifyProviderError(error: unknown): {
+  failureClass: FailureClass;
+  errorCode: string;
+} {
+  const providerError = error as { code?: unknown; status?: unknown; statusCode?: unknown };
+  const rawStatus = Number(providerError?.statusCode ?? providerError?.status);
+  const errorCode =
+    typeof providerError?.code === 'string'
+      ? providerError.code.slice(0, 64)
+      : Number.isFinite(rawStatus)
+        ? `HTTP_${rawStatus}`
+        : 'PROVIDER_ERROR';
+  const retryable =
+    rawStatus === 408 ||
+    rawStatus === 429 ||
+    rawStatus >= 500 ||
+    ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN'].includes(errorCode) ||
+    (!Number.isFinite(rawStatus) && providerError?.code == null);
+  return { failureClass: retryable ? 'retryable' : 'permanent', errorCode };
+}
+
+export function getNotificationRetryDelayMs(attempt: number, random = Math.random): number {
+  const baseDelays = [30_000, 120_000, 600_000, 1_800_000] as const;
+  const base = baseDelays[Math.max(0, Math.min(attempt - 1, baseDelays.length - 1))]!;
+  return Math.round(Math.min(60 * 60 * 1000, base * (0.5 + random())));
+}
+
+async function sendEmail(
+  email: string,
+  message: string,
+  type?: NotificationType,
+  notificationId?: number,
+  deliveryId?: string,
+): Promise<ProviderOutcome> {
   const fromEmail = process.env.FROM_EMAIL;
-  const maskedEmail = email.replace(/(.{2}).*(@.*)/, '$1***$2');
-
   if (!fromEmail) {
-    logger.withContext().info('[Email] FROM_EMAIL not set', { email: maskedEmail, message });
-    return;
+    return { status: 'permanent_failure', provider: 'sendgrid', errorCode: 'CONFIG_MISSING' };
   }
-
-  await ensureSendGrid();
-
-  if (!process.env.SENDGRID_API_KEY) {
-    logger
-      .withContext()
-      .info(`[Email] SendGrid not configured. Would send to ${maskedEmail}: ${message}`);
-    return;
-  }
-
-  const template = type
-    ? buildEmailTemplate(type, message)
-    : { subject: 'Notification from RemitLend', html: `<p>${message}</p>` };
 
   try {
+    await ensureSendGrid();
+    if (!process.env.SENDGRID_API_KEY) {
+      return { status: 'permanent_failure', provider: 'sendgrid', errorCode: 'CONFIG_MISSING' };
+    }
+
+    const template = type
+      ? buildEmailTemplate(type, message)
+      : { subject: 'Notification from RemitLend', html: `<p>${message}</p>` };
     const sgMail = await import('@sendgrid/mail');
-    await sgMail.default.send({
+    const response = await sgMail.default.send({
       to: email,
       from: fromEmail,
       subject: template.subject,
       html: template.html,
+      customArgs: {
+        remitlend_notification_id: String(notificationId ?? ''),
+        remitlend_delivery_id: deliveryId ?? '',
+      },
     });
-    logger.withContext().info(`[Email] Sent to ${maskedEmail}`, { subject: template.subject });
+    const headers = response?.[0]?.headers as Record<string, string> | undefined;
+    return {
+      status: 'accepted',
+      provider: 'sendgrid',
+      ...(headers?.['x-message-id'] ? { providerMessageId: headers['x-message-id'] } : {}),
+    };
   } catch (error) {
-    logger.withContext().error(`[Email] SendGrid failed for ${maskedEmail}`, {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    // Swallow error — email failure must not break the main flow
+    const classified = classifyProviderError(error);
+    return {
+      status: classified.failureClass === 'retryable' ? 'retryable_failure' : 'permanent_failure',
+      provider: 'sendgrid',
+      errorCode: classified.errorCode,
+    };
   }
 }
 
-async function sendSMS(phone: string, message: string) {
-  const maskedPhone = phone.length > 4 ? '+xx...****' + phone.slice(-2) : '****';
-  const twilioClient = await getTwilioClient();
-  if (!twilioClient || !process.env.TWILIO_PHONE_NUMBER) {
-    logger
-      .withContext()
-      .warn(`[SMS] Twilio not configured. Would send to ${maskedPhone}`, { message });
-    return;
-  }
-
+async function sendSMS(phone: string, message: string): Promise<ProviderOutcome> {
   try {
+    const twilioClient = await getTwilioClient();
+    if (!twilioClient || !process.env.TWILIO_PHONE_NUMBER) {
+      return { status: 'permanent_failure', provider: 'twilio', errorCode: 'CONFIG_MISSING' };
+    }
     const result = await twilioClient.messages.create({
       body: message,
       from: process.env.TWILIO_PHONE_NUMBER,
       to: phone,
     });
-    logger.withContext().info(`[SMS] Sent to ${maskedPhone}`, { sid: result.sid });
+    return {
+      status: 'accepted',
+      provider: 'twilio',
+      ...(result.sid ? { providerMessageId: result.sid } : {}),
+    };
   } catch (error) {
-    logger.withContext().error(`[SMS] Failed to send to ${maskedPhone}`, {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    // Swallow error - don't fail the notification creation
+    const classified = classifyProviderError(error);
+    return {
+      status: classified.failureClass === 'retryable' ? 'retryable_failure' : 'permanent_failure',
+      provider: 'twilio',
+      errorCode: classified.errorCode,
+    };
   }
 }
 
@@ -249,7 +300,7 @@ class NotificationService {
     this.broadcast(userId, notification);
 
     // Also trigger external notifications
-    await this.notifyUserExternal(userId, message, type);
+    await this.notifyUserExternal(notification.id, userId, message, type);
 
     return notification;
   }
@@ -295,33 +346,417 @@ class NotificationService {
    * Sends external notifications (Email/SMS) based on user preferences.
    * SMS is triggered for repayment_due and loan_defaulted events.
    */
-  private async notifyUserExternal(userId: string, message: string, type: NotificationType) {
+  private async notifyUserExternal(
+    notificationId: number,
+    userId: string,
+    message: string,
+    type: NotificationType,
+  ) {
     try {
       const result = await query(
-        `SELECT email, phone, email_enabled, sms_enabled 
-         FROM user_profiles 
-         WHERE public_key = $1`,
+        `SELECT email, phone, email_enabled, sms_enabled
+         FROM user_profiles WHERE public_key = $1 LIMIT 1`,
         [userId],
       );
 
       if (result.rows.length === 0) return;
 
-      const user = result.rows[0];
-
-      if (user.email_enabled && user.email) {
-        await sendEmail(user.email, message, type);
+      const notification = result.rows[0];
+      if (notification.email_enabled && notification.email) {
+        const deliveryId = await this.queueDelivery(notificationId, 'email', 'sendgrid');
+        if (deliveryId) {
+          await this.attemptDelivery(
+            deliveryId,
+            notificationId,
+            userId,
+            'email',
+            notification.email as string,
+            message,
+            type,
+          );
+        }
       }
 
-      // Trigger SMS for critical events: repayment_due, loan_defaulted, and loan_liquidated
       const smsEnabledForType =
         type === 'repayment_due' || type === 'loan_defaulted' || type === 'loan_liquidated';
 
-      if (user.sms_enabled && user.phone && smsEnabledForType) {
-        await sendSMS(user.phone, message);
+      if (notification.sms_enabled && notification.phone && smsEnabledForType) {
+        const deliveryId = await this.queueDelivery(notificationId, 'sms', 'twilio');
+        if (deliveryId) {
+          await this.attemptDelivery(
+            deliveryId,
+            notificationId,
+            userId,
+            'sms',
+            notification.phone as string,
+            message,
+            type,
+          );
+        }
       }
     } catch (error) {
-      logger.withContext().error('Error sending external notifications', { userId, error });
+      logger.withContext().error('Error sending external notifications', { error });
     }
+  }
+
+  private async queueDelivery(
+    notificationId: number,
+    channel: NotificationChannel,
+    provider: 'sendgrid' | 'twilio',
+  ): Promise<string | null> {
+    const result = await query(
+      `INSERT INTO notification_deliveries
+         (notification_id, channel, provider, idempotency_key, status)
+       VALUES ($1, $2, $3, $4, 'queued')
+       ON CONFLICT (notification_id, channel) DO NOTHING
+       RETURNING id`,
+      [notificationId, channel, provider, `notification-${notificationId}-${channel}`],
+    );
+    return result.rows[0] ? String(result.rows[0].id) : null;
+  }
+
+  private async attemptDelivery(
+    deliveryId: string,
+    notificationId: number,
+    userId: string,
+    channel: NotificationChannel,
+    recipient: string,
+    message: string,
+    type: NotificationType,
+  ): Promise<void> {
+    const claimed = await query(
+      `UPDATE notification_deliveries
+       SET status = 'sending', provider_message_id = NULL,
+           attempt_count = attempt_count + 1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND status IN ('queued', 'retryable_failure')
+         AND attempt_count < 5
+       RETURNING attempt_count`,
+      [deliveryId],
+    );
+    const attemptCount = Number(claimed.rows[0]?.attempt_count);
+    if (!attemptCount) return;
+
+    const outcome =
+      channel === 'email'
+        ? await sendEmail(recipient, message, type, notificationId, deliveryId)
+        : await sendSMS(recipient, message);
+    await this.persistProviderOutcome(deliveryId, channel, outcome, attemptCount);
+
+    if (
+      outcome.status === 'permanent_failure' &&
+      channel === 'email' &&
+      type === 'score_changed'
+    ) {
+      await this.queueConsentBasedSmsFailover(notificationId, userId);
+    }
+  }
+
+  private async persistProviderOutcome(
+    deliveryId: string,
+    channel: NotificationChannel,
+    outcome: ProviderOutcome,
+    attemptCount: number,
+  ): Promise<void> {
+    const exhausted = outcome.status === 'retryable_failure' && attemptCount >= 5;
+    const status = exhausted ? 'permanent_failure' : outcome.status;
+    const nextAttemptAt =
+      status === 'retryable_failure'
+        ? new Date(Date.now() + getNotificationRetryDelayMs(attemptCount))
+        : null;
+    const errorCode = outcome.errorCode ?? (exhausted ? 'RETRY_EXHAUSTED' : null);
+    await query(
+      `INSERT INTO notification_delivery_attempts
+         (delivery_id, attempt_number, provider, provider_message_id, status, error_code,
+          accepted_at, delivered_at)
+       VALUES ($1, $2, $3, $4, $5, $6,
+               CASE WHEN $5 = 'accepted' THEN CURRENT_TIMESTAMP ELSE NULL END,
+               CASE WHEN $5 = 'delivered' THEN CURRENT_TIMESTAMP ELSE NULL END)
+       ON CONFLICT (delivery_id, attempt_number) DO UPDATE
+       SET provider_message_id = EXCLUDED.provider_message_id,
+           status = EXCLUDED.status,
+           error_code = EXCLUDED.error_code,
+           accepted_at = EXCLUDED.accepted_at`,
+      [
+        deliveryId,
+        attemptCount,
+        outcome.provider,
+        outcome.providerMessageId ?? null,
+        status,
+        errorCode,
+      ],
+    );
+    await query(
+      `UPDATE notification_deliveries
+       SET provider = $1, provider_message_id = $2,
+           status = $3, last_error_code = $4, next_attempt_at = $5,
+           accepted_at = CASE WHEN $3 = 'accepted' THEN CURRENT_TIMESTAMP ELSE accepted_at END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $6`,
+      [
+        outcome.provider,
+        outcome.providerMessageId ?? null,
+        status,
+        errorCode,
+        nextAttemptAt,
+        deliveryId,
+      ],
+    );
+    if (status === 'retryable_failure' || status === 'permanent_failure') {
+      notificationDeliveryFailuresCounter.inc({
+        channel,
+        provider: outcome.provider,
+        failure_class: status === 'retryable_failure' ? 'retryable' : 'permanent',
+      });
+      logger.warn('Notification delivery failed', {
+        deliveryId,
+        channel,
+        provider: outcome.provider,
+        failureClass: status === 'retryable_failure' ? 'retryable' : 'permanent',
+        errorCode: outcome.errorCode ?? (exhausted ? 'RETRY_EXHAUSTED' : 'UNKNOWN'),
+        attemptCount,
+      });
+    }
+  }
+
+  private async queueConsentBasedSmsFailover(
+    notificationId: number,
+    userId: string,
+  ): Promise<void> {
+    const consent = await query(
+      `SELECT sms_enabled, phone
+       FROM user_profiles WHERE public_key = $1 LIMIT 1`,
+      [userId],
+    );
+    const profile = consent.rows[0];
+    if (!profile?.sms_enabled || typeof profile.phone !== 'string' || !profile.phone) return;
+
+    await query(
+      `INSERT INTO notification_deliveries
+         (notification_id, channel, provider, idempotency_key, status)
+       SELECT n.id, 'sms', 'twilio', $2, 'queued'
+       FROM notifications n
+       WHERE n.id = $1 AND n.type = 'score_changed'
+       ON CONFLICT (notification_id, channel) DO NOTHING`,
+      [notificationId, `notification-${notificationId}-sms-failover`],
+    );
+  }
+
+  async processDeliveryRetries(): Promise<void> {
+    const recovered = await query(
+      `UPDATE notification_deliveries
+       SET status = CASE WHEN attempt_count >= 5 THEN 'permanent_failure' ELSE 'retryable_failure' END,
+           next_attempt_at = CASE WHEN attempt_count >= 5 THEN NULL ELSE CURRENT_TIMESTAMP END,
+           last_error_code = 'ATTEMPT_RECOVERY',
+           updated_at = CURRENT_TIMESTAMP
+       FROM notifications n
+       WHERE notification_deliveries.notification_id = n.id
+         AND notification_deliveries.status = 'sending'
+         AND notification_deliveries.updated_at < CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+       RETURNING notification_deliveries.notification_id, notification_deliveries.channel,
+                 notification_deliveries.attempt_count, n.user_id`,
+    );
+    for (const delivery of recovered.rows) {
+      if (delivery.channel === 'email' && Number(delivery.attempt_count) >= 5) {
+        await this.queueConsentBasedSmsFailover(
+          Number(delivery.notification_id),
+          String(delivery.user_id),
+        );
+      }
+    }
+    const claimed = await query(
+      `WITH due AS (
+         SELECT id
+         FROM notification_deliveries
+         WHERE status IN ('queued', 'retryable_failure')
+           AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
+           AND attempt_count < 5
+         ORDER BY COALESCE(next_attempt_at, created_at), created_at
+         LIMIT 50
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE notification_deliveries d
+       SET status = 'sending', provider_message_id = NULL,
+           attempt_count = d.attempt_count + 1,
+           updated_at = CURRENT_TIMESTAMP
+       FROM due
+       WHERE d.id = due.id
+       RETURNING d.id, d.notification_id, d.channel, d.provider, d.attempt_count`,
+    );
+
+    for (const delivery of claimed.rows) {
+      try {
+        const detail = await query(
+          `SELECT n.user_id, n.type, n.message, p.email, p.phone, p.email_enabled, p.sms_enabled
+           FROM notifications n
+           JOIN user_profiles p ON p.public_key = n.user_id
+           WHERE n.id = $1`,
+          [delivery.notification_id],
+        );
+        const recipient = detail.rows[0];
+        const channel = delivery.channel as NotificationChannel;
+        const enabled =
+          channel === 'email'
+            ? recipient?.email_enabled && recipient.email
+            : recipient?.sms_enabled && recipient.phone;
+        if (!recipient || !enabled) {
+          await this.persistProviderOutcome(
+            String(delivery.id),
+            channel,
+            {
+              status: 'permanent_failure',
+              provider: channel === 'email' ? 'sendgrid' : 'twilio',
+              errorCode: 'CONSENT_OR_RECIPIENT_UNAVAILABLE',
+            },
+            Number(delivery.attempt_count),
+          );
+          continue;
+        }
+        await this.deliverClaimed(
+          delivery,
+          recipient,
+          channel,
+          channel === 'email' ? String(recipient.email) : String(recipient.phone),
+        );
+      } catch (error) {
+        logger.error('Notification retry attempt failed', {
+          deliveryId: String(delivery.id),
+          error,
+        });
+      }
+    }
+  }
+
+  private async deliverClaimed(
+    delivery: Record<string, unknown>,
+    notification: Record<string, unknown>,
+    channel: NotificationChannel,
+    recipient: string,
+  ): Promise<void> {
+    const type = notification.type as NotificationType;
+    const outcome =
+      channel === 'email'
+        ? await sendEmail(
+            recipient,
+            String(notification.message),
+            type,
+            Number(delivery.notification_id),
+            String(delivery.id),
+          )
+        : await sendSMS(recipient, String(notification.message));
+    await this.persistProviderOutcome(
+      String(delivery.id),
+      channel,
+      outcome,
+      Number(delivery.attempt_count),
+    );
+    if (
+      outcome.status === 'permanent_failure' &&
+      channel === 'email' &&
+      type === 'score_changed'
+    ) {
+      await this.queueConsentBasedSmsFailover(
+        Number(delivery.notification_id),
+        String(notification.user_id),
+      );
+    }
+  }
+
+  async recordProviderReceipt(input: {
+    provider: 'sendgrid' | 'twilio';
+    providerMessageId: string;
+    status: 'delivered' | 'retryable_failure' | 'permanent_failure';
+    errorCode?: string;
+  }): Promise<boolean> {
+    return withTransaction(async (client) => {
+      const selected = await client.query(
+        `SELECT d.id, d.channel, d.status, a.id AS attempt_id, a.status AS attempt_status,
+                a.created_at, n.created_at AS notification_created_at,
+                d.attempt_count, d.provider_message_id AS current_provider_message_id
+         FROM notification_delivery_attempts a
+         JOIN notification_deliveries d ON d.id = a.delivery_id
+         JOIN notifications n ON n.id = d.notification_id
+         WHERE a.provider = $1 AND a.provider_message_id = $2
+         FOR UPDATE`,
+        [input.provider, input.providerMessageId],
+      );
+      const delivery = selected.rows[0] as Record<string, unknown> | undefined;
+      if (!delivery) return false;
+      if (
+        delivery.attempt_status === 'delivered' ||
+        delivery.attempt_status === 'permanent_failure'
+      ) {
+        return true;
+      }
+      if (delivery.attempt_status === input.status) return true;
+
+      const effectiveStatus =
+        input.status === 'retryable_failure' && Number(delivery.attempt_count) >= 5
+          ? 'permanent_failure'
+          : input.status;
+      const errorCode =
+        effectiveStatus === 'permanent_failure' && input.status === 'retryable_failure'
+          ? 'RETRY_EXHAUSTED'
+          : (input.errorCode ?? null);
+      const nextAttemptAt =
+        effectiveStatus === 'retryable_failure'
+          ? new Date(
+              Date.now() +
+                getNotificationRetryDelayMs(Number(delivery.attempt_count)),
+            )
+          : null;
+      await client.query(
+        `UPDATE notification_delivery_attempts
+         SET status = $1, error_code = $2,
+             delivered_at = CASE WHEN $1 = 'delivered' THEN CURRENT_TIMESTAMP ELSE delivered_at END
+         WHERE id = $3`,
+        [effectiveStatus, errorCode, delivery.attempt_id],
+      );
+      const parentUpdate = await client.query(
+        `UPDATE notification_deliveries
+         SET status = $1, last_error_code = $2, next_attempt_at = $3,
+             delivered_at = CASE WHEN $1 = 'delivered' THEN CURRENT_TIMESTAMP ELSE delivered_at END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $4 AND status <> 'delivered'
+           AND ($1 = 'delivered' OR provider_message_id = $5)`,
+        [effectiveStatus, errorCode, nextAttemptAt, delivery.id, input.providerMessageId],
+      );
+      if (effectiveStatus === 'delivered') {
+        if ((parentUpdate.rowCount ?? 0) > 0) {
+          const lagSeconds =
+            (Date.now() - new Date(String(delivery.notification_created_at)).getTime()) / 1000;
+          notificationDeliveryLagHistogram.observe(
+            { channel: String(delivery.channel), provider: input.provider },
+            Math.max(0, lagSeconds),
+          );
+        }
+      } else {
+        notificationDeliveryFailuresCounter.inc({
+          channel: String(delivery.channel),
+          provider: input.provider,
+          failure_class: effectiveStatus === 'retryable_failure' ? 'retryable' : 'permanent',
+        });
+        if (
+          effectiveStatus === 'permanent_failure' &&
+          delivery.current_provider_message_id === input.providerMessageId
+        ) {
+          await client.query(
+            `INSERT INTO notification_deliveries
+               (notification_id, channel, provider, idempotency_key, status)
+             SELECT n.id, 'sms', 'twilio',
+                    'notification-' || n.id::text || '-sms-failover', 'queued'
+             FROM notification_deliveries d
+             JOIN notifications n ON n.id = d.notification_id
+             JOIN user_profiles p ON p.public_key = n.user_id
+             WHERE d.id = $1 AND d.channel = 'email' AND d.provider_message_id = $2
+               AND n.type = 'score_changed' AND p.sms_enabled = true
+               AND p.phone IS NOT NULL AND p.phone <> ''
+             ON CONFLICT (notification_id, channel) DO NOTHING`,
+            [delivery.id, input.providerMessageId],
+          );
+        }
+      }
+      return true;
+    });
   }
 
   /**
@@ -614,6 +1049,25 @@ class NotificationService {
 export const notificationService = new NotificationService();
 
 let cleanupInterval: ReturnType<typeof setInterval> | undefined;
+let deliveryRetryInterval: ReturnType<typeof setInterval> | undefined;
+
+export function startNotificationDeliveryProcessor(): void {
+  if (deliveryRetryInterval) return;
+  const run = () => {
+    notificationService.processDeliveryRetries().catch((error) => {
+      logger.error('Notification delivery processor failed', { error });
+    });
+  };
+  run();
+  deliveryRetryInterval = setInterval(run, 10_000);
+  deliveryRetryInterval.unref?.();
+}
+
+export function stopNotificationDeliveryProcessor(): void {
+  if (!deliveryRetryInterval) return;
+  clearInterval(deliveryRetryInterval);
+  deliveryRetryInterval = undefined;
+}
 
 /**
  * Starts a periodic scheduler to clean up old notifications based on retention policy.

@@ -24,6 +24,8 @@ import { eventStreamService } from './services/eventStreamService.js';
 import {
   startNotificationCleanupScheduler,
   stopNotificationCleanupScheduler,
+  startNotificationDeliveryProcessor,
+  stopNotificationDeliveryProcessor,
 } from './services/notificationService.js';
 import {
   startScoreReconciliationScheduler,
@@ -113,6 +115,7 @@ const server = app.listen(port, () => {
 
   // Start periodic notification cleanup
   startNotificationCleanupScheduler();
+  startNotificationDeliveryProcessor();
 
   startSubjectAccessExportProcessor();
 
@@ -174,6 +177,7 @@ const shutdown = async (signal: 'SIGTERM' | 'SIGINT') => {
     stopScoreReconciliationScheduler();
     stopCrossContractReconciler();
     stopNotificationCleanupScheduler();
+    stopNotificationDeliveryProcessor();
     stopSubjectAccessExportProcessor();
     logger.info('All schedulers stopped.');
 
