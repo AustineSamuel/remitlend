@@ -18,6 +18,7 @@ import indexerRoutes from './routes/indexerRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
 import authRoutes from './routes/authRoutes.js';
 import userRoutes from './routes/userRoutes.js';
+import subjectAccessExportRoutes from './routes/subjectAccessExportRoutes.js';
 import notificationsRoutes from './routes/notificationsRoutes.js';
 import eventRoutes from './routes/eventRoutes.js';
 import remittanceRoutes from './routes/remittanceRoutes.js';
@@ -401,6 +402,7 @@ app.use('/api/v1/pool', poolRoutes);
 app.use('/api/v1/notifications', notificationsRoutes);
 app.use('/api/v1/events', eventRoutes);
 app.use('/user', userRoutes);
+app.use('/user/data-exports', subjectAccessExportRoutes);
 
 // Internal service-to-service routes (HMAC-signed only)
 app.use('/api/internal', internalRoutes);

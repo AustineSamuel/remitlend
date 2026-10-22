@@ -34,6 +34,10 @@ import {
   stopCrossContractReconciler,
 } from './services/crossContractReconciler.js';
 import { sorobanService } from './services/sorobanService.js';
+import {
+  startSubjectAccessExportProcessor,
+  stopSubjectAccessExportProcessor,
+} from './services/subjectAccessExportService.js';
 import { validateLoanConfigOnStartup } from './config/loanConfig.js';
 import { startLoanDueCheckCron, stopLoanDueCheckCron } from './cron/loanCheckCron.js';
 import {
@@ -110,6 +114,8 @@ const server = app.listen(port, () => {
   // Start periodic notification cleanup
   startNotificationCleanupScheduler();
 
+  startSubjectAccessExportProcessor();
+
   // Start loan due check cron
   startLoanDueCheckCron();
 
@@ -168,6 +174,7 @@ const shutdown = async (signal: 'SIGTERM' | 'SIGINT') => {
     stopScoreReconciliationScheduler();
     stopCrossContractReconciler();
     stopNotificationCleanupScheduler();
+    stopSubjectAccessExportProcessor();
     logger.info('All schedulers stopped.');
 
     // Step 3: Close event streams
