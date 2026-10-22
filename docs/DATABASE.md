@@ -357,7 +357,48 @@ This table stores per-user digest frequency settings independently.
 
 ---
 
+## Table: `diagnostic_bundles`
+
+Stores user-authorized, privacy-safe diagnostic bundles for transaction incidents
+(see `docs/SUPPORT_DIAGNOSTIC_BUNDLES.md`). A bundle is generated only on explicit
+user action, is scoped to a transaction the requesting user may access, and contains
+only the fields defined by the bundle schema allowlist. Raw payloads, signed
+envelopes, XDR, and authentication material are never written to this table.
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | `uuid` | `PRIMARY KEY, DEFAULT gen_random_uuid()` | Bundle identifier returned to the user and support |
+| `tx_hash` | `varchar(64)` | `NOT NULL` | Transaction reference the bundle describes; not a hard FK (transactions may live in `transaction_submissions` or `remittances`) |
+| `owner_public_key` | `varchar(56)` | `NOT NULL` | Stellar public key of the user who authorized generation; used to scope access |
+| `payload` | `jsonb` | `NOT NULL` | Allowlisted, already-redacted bundle fields only (status, timestamps, failure category, app version, correlation IDs) |
+| `created_at` | `timestamp with time zone` | `NOT NULL, DEFAULT NOW()` | Generation time |
+| `expires_at` | `timestamp with time zone` | `NOT NULL` | Short retention boundary (24 hours after `created_at`); expired bundles are not served |
+
+**Indexes**:
+- `diagnostic_bundles_expires_at_idx` on `expires_at`
+- `diagnostic_bundles_owner_public_key_idx` on `owner_public_key`
+- `diagnostic_bundles_owner_tx_idx` on `(owner_public_key, tx_hash)`
+
+**Retention**: bundles expire 24 hours after creation. Expired rows are deleted in
+batches (at most 500 per run) by the cleanup job:
+
+```sql
+DELETE FROM diagnostic_bundles
+WHERE id IN (
+  SELECT id FROM diagnostic_bundles
+  WHERE expires_at < NOW()
+  ORDER BY expires_at
+  LIMIT 500
+);
+```
+
+Reads must filter on `expires_at > NOW()` so an expired bundle is never returned,
+even before the cleanup job runs.
+
+---
+
 ## Table: `auth_challenge_nonces`
+=======
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
@@ -387,6 +428,7 @@ notifications (many per user) ──> user_id
 webhook_deliveries (many per subscription) ──> subscription_id -> webhook_subscriptions
 loan_disputes (1:1 per disputed loan) ──> loan_id -> contract_events(loan_id)
 user_profiles (1:1 per address) ──> public_key
+diagnostic_bundles (many per user) ──> owner_public_key -> user_profiles(public_key)
 ```
 
 ### Event Flow

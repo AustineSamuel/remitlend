@@ -2,6 +2,11 @@ import type { Request, Response } from 'express';
 import { query } from '../db/connection.js';
 import { AppError } from '../errors/AppError.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import {
+  createDiagnosticBundle as createDiagnosticBundleService,
+  getDiagnosticBundle as getDiagnosticBundleService,
+  deleteDiagnosticBundle as deleteDiagnosticBundleService,
+} from '../services/diagnosticBundleService.js';
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 500;
@@ -71,4 +76,81 @@ export const listMyTransactions = asyncHandler(async (req: Request, res: Respons
       has_next: hasNext,
     },
   });
+});
+
+export const createDiagnosticBundle = asyncHandler(async (req: Request, res: Response) => {
+  const publicKey = req.user?.publicKey;
+  if (!publicKey) {
+    throw AppError.unauthorized('Authentication required');
+  }
+
+  const body = req.body as { confirm?: unknown } | undefined;
+  if (!body || body.confirm !== true) {
+    throw AppError.badRequest('Explicit confirmation required to generate a diagnostic bundle');
+  }
+
+  const transactionRef = req.params.transactionRef;
+  if (typeof transactionRef !== 'string' || transactionRef.trim().length === 0) {
+    throw AppError.badRequest('Transaction reference is required');
+  }
+
+  const bundle = await createDiagnosticBundleService(publicKey, transactionRef);
+
+  // Never return bundle contents from the create response; only the handle and expiry.
+  res.status(201).json({
+    success: true,
+    data: {
+      id: bundle.id,
+      expiresAt: bundle.expiresAt,
+    },
+  });
+});
+
+export const getDiagnosticBundle = asyncHandler(async (req: Request, res: Response) => {
+  const publicKey = req.user?.publicKey;
+  if (!publicKey) {
+    throw AppError.unauthorized('Authentication required');
+  }
+
+  const bundleId = req.params.bundleId;
+  if (typeof bundleId !== 'string' || bundleId.trim().length === 0) {
+    throw AppError.badRequest('Bundle id is required');
+  }
+
+  const bundle = await getDiagnosticBundleService(publicKey, bundleId);
+  if (!bundle) {
+    throw AppError.notFound('Diagnostic bundle not found');
+  }
+  if (bundle.expired) {
+    throw AppError.gone('Diagnostic bundle has expired');
+  }
+
+  res.json({
+    success: true,
+    data: {
+      id: bundle.id,
+      createdAt: bundle.createdAt,
+      expiresAt: bundle.expiresAt,
+      contents: bundle.contents,
+    },
+  });
+});
+
+export const deleteDiagnosticBundle = asyncHandler(async (req: Request, res: Response) => {
+  const publicKey = req.user?.publicKey;
+  if (!publicKey) {
+    throw AppError.unauthorized('Authentication required');
+  }
+
+  const bundleId = req.params.bundleId;
+  if (typeof bundleId !== 'string' || bundleId.trim().length === 0) {
+    throw AppError.badRequest('Bundle id is required');
+  }
+
+  const deleted = await deleteDiagnosticBundleService(publicKey, bundleId);
+  if (!deleted) {
+    throw AppError.notFound('Diagnostic bundle not found');
+  }
+
+  res.status(204).send();
 });

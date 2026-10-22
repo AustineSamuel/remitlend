@@ -170,6 +170,21 @@ export const envSchema = z.object({
   // ── Debugging ────────────────────────────────────────────────────────────
   EXPOSE_STACK_TRACES: booleanString().default('false' as unknown as never),
 
+  // ── Diagnostic bundles ───────────────────────────────────────────────────
+  /**
+   * How long (in hours) a generated transaction diagnostic bundle remains
+   * downloadable before it expires and is purged. Bundles are intentionally
+   * short-lived; keep this small (default 24h, max 168h = 7 days).
+   */
+  DIAGNOSTIC_BUNDLE_TTL_HOURS: positiveInt(1, 168).default(24 as unknown as never),
+
+  /**
+   * Hard upper bound (in bytes) on the serialized diagnostic bundle. The
+   * bundle generator refuses to emit anything larger, keeping artifacts
+   * bounded and safe to attach to support tickets.
+   */
+  DIAGNOSTIC_BUNDLE_MAX_BYTES: positiveInt(1).default(65536 as unknown as never),
+
   // ── External services (optional) ─────────────────────────────────────────
   SENTRY_DSN: optionalString(),
 
