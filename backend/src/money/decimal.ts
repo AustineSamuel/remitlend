@@ -173,6 +173,23 @@ export function roundToCents(value: number, mode: RoundingMode = DEFAULT_MODE): 
  * time to the entries with the largest fractional remainder, breaking ties
  * by lowest index for determinism.
  */
+/**
+ * The canonical cross-asset conformance vector set, as consumed by the
+ * TypeScript conformance test (`backend/src/__tests__/moneyConformance.test.ts`).
+ *
+ * This is the *same* versioned file the Rust `contracts/money` crate loads, so
+ * both implementations are exercised against one shared fixture rather than
+ * copied per-language copies. The path is resolved relative to the repo root
+ * so the test can be run from either `backend/` or the repository root.
+ */
+export const CONFORMANCE_VECTORS_PATH = 'contracts/money/vectors/money-policy.v1.json';
+
+/**
+ * Package name reported when a conformance vector diverges, so CI output
+ * identifies which implementation failed.
+ */
+export const CONFORMANCE_PACKAGE_NAME = 'backend';
+
 export function splitProRata(total: bigint, weights: readonly bigint[]): bigint[] {
   if (total < 0n) {
     throw new MoneyError('total must be non-negative');

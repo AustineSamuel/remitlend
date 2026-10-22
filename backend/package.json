@@ -10,6 +10,7 @@
     "typecheck": "tsc -p tsconfig.build.json --noEmit",
     "start": "node dist/index.js",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "test:money-conformance": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath src/__tests__/moneyConformance.test.ts",
     "docs:check": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath src/__tests__/apiReference.test.ts src/__tests__/domainStateMachineDocs.test.ts src/__tests__/securityRegisterDocs.test.ts",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",

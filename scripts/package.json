@@ -8,7 +8,8 @@
     "typecheck": "tsc --noEmit",
     "gen:money": "ts-node gen-money.ts",
     "gen:money:check": "ts-node gen-money.ts --check",
-    "money:property-test": "tsx money-property-test.ts"
+    "money:property-test": "tsx money-property-test.ts",
+    "money:conformance": "tsx check-money-conformance.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^17.2.1",

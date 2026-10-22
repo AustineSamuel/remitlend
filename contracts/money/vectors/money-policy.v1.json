@@ -1,0 +1,413 @@
+{
+  "version": 1,
+  "description": "Canonical money policy conformance vectors shared by contracts/money (Rust) and backend/src/money/decimal.ts (TypeScript). All numeric values are decimal strings so i128 values survive JSON round-trips. Each vector has an id, asset_precision (integer decimal places), operation, operation inputs, and expected result (ok + result string, or error + stable error code).",
+  "operations": {
+    "round_div": {
+      "inputs": ["numerator", "denominator"],
+      "description": "Divide numerator by denominator with half-to-even rounding, returning an integer decimal string."
+    },
+    "to_stroops": {
+      "inputs": ["amount"],
+      "description": "Convert a decimal amount string to integer minor units (stroops) at asset_precision."
+    },
+    "from_stroops": {
+      "inputs": ["stroops"],
+      "description": "Convert integer minor units (stroops) to a decimal amount string at asset_precision."
+    },
+    "split_pro_rata": {
+      "inputs": ["total", "weights"],
+      "description": "Split total pro-rata by weights (array of decimal strings), returning an array of integer decimal strings that sum exactly to total."
+    },
+    "bounded_add": {
+      "inputs": ["a", "b", "min", "max"],
+      "description": "Add a and b, rejecting results outside [min, max]."
+    },
+    "bounded_sub": {
+      "inputs": ["a", "b", "min", "max"],
+      "description": "Subtract b from a, rejecting results outside [min, max]."
+    },
+    "mul_div": {
+      "inputs": ["a", "b", "denominator"],
+      "description": "Compute (a * b) / denominator with half-to-even rounding, rejecting overflow."
+    }
+  },
+  "error_codes": {
+    "ERR_UNSUPPORTED_PRECISION": "asset_precision is not in the supported set (must be 1..=18).",
+    "ERR_OVERFLOW": "result does not fit in i128.",
+    "ERR_DIVISION_BY_ZERO": "denominator is zero.",
+    "ERR_INVALID_SIGN": "negative value where sign is disallowed.",
+    "ERR_INVALID_SCALE": "amount has more fractional digits than asset_precision, or malformed decimal string.",
+    "ERR_OUT_OF_BOUNDS": "result outside [min, max].",
+    "ERR_EMPTY_WEIGHTS": "weights array is empty or sums to zero."
+  },
+  "vectors": [
+    {
+      "id": "round_div-zero-numerator",
+      "asset_precision": 7,
+      "operation": "round_div",
+      "inputs": { "numerator": "0", "denominator": "3" },
+      "expected": { "ok": "0" }
+    },
+    {
+      "id": "round_div-one-minor-unit",
+      "asset_precision": 7,
+      "operation": "round_div",
+      "inputs": { "numerator": "1", "denominator": "1" },
+      "expected": { "ok": "1" }
+    },
+    {
+      "id": "round_div-half-even-down",
+      "asset_precision": 7,
+      "operation": "round_div",
+      "inputs": { "numerator": "5", "denominator": "2" },
+      "expected": { "ok": "2" }
+    },
+    {
+      "id": "round_div-half-even-up",
+      "asset_precision": 7,
+      "operation": "round_div",
+      "inputs": { "numerator": "7", "denominator": "2" },
+      "expected": { "ok": "4" }
+    },
+    {
+      "id": "round_div-half-even-negative-down",
+      "asset_precision": 7,
+      "operation": "round_div",
+      "inputs": { "numerator": "-5", "denominator": "2" },
+      "expected": { "ok": "-2" }
+    },
+    {
+      "id": "round_div-half-even-negative-up",
+      "asset_precision": 7,
+      "operation": "round_div",
+      "inputs": { "numerator": "-7", "denominator": "2" },
+      "expected": { "ok": "-4" }
+    },
+    {
+      "id": "round_div-division-by-zero",
+      "asset_precision": 7,
+      "operation": "round_div",
+      "inputs": { "numerator": "1", "denominator": "0" },
+      "expected": { "error": "ERR_DIVISION_BY_ZERO" }
+    },
+    {
+      "id": "round_div-max-i128",
+      "asset_precision": 7,
+      "operation": "round_div",
+      "inputs": { "numerator": "170141183460469231731687303715884105727", "denominator": "1" },
+      "expected": { "ok": "170141183460469231731687303715884105727" }
+    },
+    {
+      "id": "round_div-min-i128",
+      "asset_precision": 7,
+      "operation": "round_div",
+      "inputs": { "numerator": "-170141183460469231731687303715884105728", "denominator": "1" },
+      "expected": { "ok": "-170141183460469231731687303715884105728" }
+    },
+    {
+      "id": "to_stroops-zero",
+      "asset_precision": 7,
+      "operation": "to_stroops",
+      "inputs": { "amount": "0" },
+      "expected": { "ok": "0" }
+    },
+    {
+      "id": "to_stroops-one-minor-unit",
+      "asset_precision": 7,
+      "operation": "to_stroops",
+      "inputs": { "amount": "0.0000001" },
+      "expected": { "ok": "1" }
+    },
+    {
+      "id": "to_stroops-whole",
+      "asset_precision": 7,
+      "operation": "to_stroops",
+      "inputs": { "amount": "1" },
+      "expected": { "ok": "10000000" }
+    },
+    {
+      "id": "to_stroops-max",
+      "asset_precision": 7,
+      "operation": "to_stroops",
+      "inputs": { "amount": "17014118346046923173168730371588.4105727" },
+      "expected": { "ok": "170141183460469231731687303715884105727" }
+    },
+    {
+      "id": "to_stroops-overflow",
+      "asset_precision": 7,
+      "operation": "to_stroops",
+      "inputs": { "amount": "17014118346046923173168730371588.4105728" },
+      "expected": { "error": "ERR_OVERFLOW" }
+    },
+    {
+      "id": "to_stroops-invalid-scale",
+      "asset_precision": 7,
+      "operation": "to_stroops",
+      "inputs": { "amount": "0.00000001" },
+      "expected": { "error": "ERR_INVALID_SCALE" }
+    },
+    {
+      "id": "to_stroops-invalid-sign",
+      "asset_precision": 7,
+      "operation": "to_stroops",
+      "inputs": { "amount": "-1" },
+      "expected": { "error": "ERR_INVALID_SIGN" }
+    },
+    {
+      "id": "to_stroops-unsupported-precision-zero",
+      "asset_precision": 0,
+      "operation": "to_stroops",
+      "inputs": { "amount": "1" },
+      "expected": { "error": "ERR_UNSUPPORTED_PRECISION" }
+    },
+    {
+      "id": "to_stroops-unsupported-precision-nineteen",
+      "asset_precision": 19,
+      "operation": "to_stroops",
+      "inputs": { "amount": "1" },
+      "expected": { "error": "ERR_UNSUPPORTED_PRECISION" }
+    },
+    {
+      "id": "from_stroops-zero",
+      "asset_precision": 7,
+      "operation": "from_stroops",
+      "inputs": { "stroops": "0" },
+      "expected": { "ok": "0" }
+    },
+    {
+      "id": "from_stroops-one-minor-unit",
+      "asset_precision": 7,
+      "operation": "from_stroops",
+      "inputs": { "stroops": "1" },
+      "expected": { "ok": "0.0000001" }
+    },
+    {
+      "id": "from_stroops-whole",
+      "asset_precision": 7,
+      "operation": "from_stroops",
+      "inputs": { "stroops": "10000000" },
+      "expected": { "ok": "1" }
+    },
+    {
+      "id": "from_stroops-max",
+      "asset_precision": 7,
+      "operation": "from_stroops",
+      "inputs": { "stroops": "170141183460469231731687303715884105727" },
+      "expected": { "ok": "17014118346046923173168730371588.4105727" }
+    },
+    {
+      "id": "from_stroops-invalid-sign",
+      "asset_precision": 7,
+      "operation": "from_stroops",
+      "inputs": { "stroops": "-1" },
+      "expected": { "error": "ERR_INVALID_SIGN" }
+    },
+    {
+      "id": "from_stroops-unsupported-precision-zero",
+      "asset_precision": 0,
+      "operation": "from_stroops",
+      "inputs": { "stroops": "1" },
+      "expected": { "error": "ERR_UNSUPPORTED_PRECISION" }
+    },
+    {
+      "id": "from_stroops-unsupported-precision-nineteen",
+      "asset_precision": 19,
+      "operation": "from_stroops",
+      "inputs": { "stroops": "1" },
+      "expected": { "error": "ERR_UNSUPPORTED_PRECISION" }
+    },
+    {
+      "id": "split_pro_rata-zero-total",
+      "asset_precision": 7,
+      "operation": "split_pro_rata",
+      "inputs": { "total": "0", "weights": ["1", "1", "1"] },
+      "expected": { "ok": ["0", "0", "0"] }
+    },
+    {
+      "id": "split_pro_rata-one-minor-unit",
+      "asset_precision": 7,
+      "operation": "split_pro_rata",
+      "inputs": { "total": "1", "weights": ["1", "1", "1"] },
+      "expected": { "ok": ["1", "0", "0"] }
+    },
+    {
+      "id": "split_pro_rata-even",
+      "asset_precision": 7,
+      "operation": "split_pro_rata",
+      "inputs": { "total": "100", "weights": ["1", "1", "1", "1"] },
+      "expected": { "ok": ["25", "25", "25", "25"] }
+    },
+    {
+      "id": "split_pro_rata-remainder",
+      "asset_precision": 7,
+      "operation": "split_pro_rata",
+      "inputs": { "total": "10", "weights": ["1", "1", "1"] },
+      "expected": { "ok": ["4", "3", "3"] }
+    },
+    {
+      "id": "split_pro_rata-empty-weights",
+      "asset_precision": 7,
+      "operation": "split_pro_rata",
+      "inputs": { "total": "10", "weights": [] },
+      "expected": { "error": "ERR_EMPTY_WEIGHTS" }
+    },
+    {
+      "id": "split_pro_rata-zero-weights",
+      "asset_precision": 7,
+      "operation": "split_pro_rata",
+      "inputs": { "total": "10", "weights": ["0", "0"] },
+      "expected": { "error": "ERR_EMPTY_WEIGHTS" }
+    },
+    {
+      "id": "bounded_add-zero",
+      "asset_precision": 7,
+      "operation": "bounded_add",
+      "inputs": { "a": "0", "b": "0", "min": "0", "max": "100" },
+      "expected": { "ok": "0" }
+    },
+    {
+      "id": "bounded_add-one-minor-unit",
+      "asset_precision": 7,
+      "operation": "bounded_add",
+      "inputs": { "a": "0", "b": "1", "min": "0", "max": "100" },
+      "expected": { "ok": "1" }
+    },
+    {
+      "id": "bounded_add-max",
+      "asset_precision": 7,
+      "operation": "bounded_add",
+      "inputs": { "a": "50", "b": "50", "min": "0", "max": "100" },
+      "expected": { "ok": "100" }
+    },
+    {
+      "id": "bounded_add-out-of-bounds",
+      "asset_precision": 7,
+      "operation": "bounded_add",
+      "inputs": { "a": "50", "b": "51", "min": "0", "max": "100" },
+      "expected": { "error": "ERR_OUT_OF_BOUNDS" }
+    },
+    {
+      "id": "bounded_add-overflow",
+      "asset_precision": 7,
+      "operation": "bounded_add",
+      "inputs": {
+        "a": "170141183460469231731687303715884105727",
+        "b": "1",
+        "min": "0",
+        "max": "170141183460469231731687303715884105727"
+      },
+      "expected": { "error": "ERR_OVERFLOW" }
+    },
+    {
+      "id": "bounded_sub-zero",
+      "asset_precision": 7,
+      "operation": "bounded_sub",
+      "inputs": { "a": "0", "b": "0", "min": "0", "max": "100" },
+      "expected": { "ok": "0" }
+    },
+    {
+      "id": "bounded_sub-one-minor-unit",
+      "asset_precision": 7,
+      "operation": "bounded_sub",
+      "inputs": { "a": "1", "b": "0", "min": "0", "max": "100" },
+      "expected": { "ok": "1" }
+    },
+    {
+      "id": "bounded_sub-to-zero",
+      "asset_precision": 7,
+      "operation": "bounded_sub",
+      "inputs": { "a": "100", "b": "100", "min": "0", "max": "100" },
+      "expected": { "ok": "0" }
+    },
+    {
+      "id": "bounded_sub-out-of-bounds",
+      "asset_precision": 7,
+      "operation": "bounded_sub",
+      "inputs": { "a": "0", "b": "1", "min": "0", "max": "100" },
+      "expected": { "error": "ERR_OUT_OF_BOUNDS" }
+    },
+    {
+      "id": "bounded_sub-overflow",
+      "asset_precision": 7,
+      "operation": "bounded_sub",
+      "inputs": {
+        "a": "-170141183460469231731687303715884105728",
+        "b": "1",
+        "min": "-170141183460469231731687303715884105728",
+        "max": "0"
+      },
+      "expected": { "error": "ERR_OVERFLOW" }
+    },
+    {
+      "id": "mul_div-zero",
+      "asset_precision": 7,
+      "operation": "mul_div",
+      "inputs": { "a": "0", "b": "100", "denominator": "3" },
+      "expected": { "ok": "0" }
+    },
+    {
+      "id": "mul_div-one-minor-unit",
+      "asset_precision": 7,
+      "operation": "mul_div",
+      "inputs": { "a": "1", "b": "1", "denominator": "1" },
+      "expected": { "ok": "1" }
+    },
+    {
+      "id": "mul_div-half-even-down",
+      "asset_precision": 7,
+      "operation": "mul_div",
+      "inputs": { "a": "5", "b": "1", "denominator": "2" },
+      "expected": { "ok": "2" }
+    },
+    {
+      "id": "mul_div-half-even-up",
+      "asset_precision": 7,
+      "operation": "mul_div",
+      "inputs": { "a": "7", "b": "1", "denominator": "2" },
+      "expected": { "ok": "4" }
+    },
+    {
+      "id": "mul_div-half-even-negative-down",
+      "asset_precision": 7,
+      "operation": "mul_div",
+      "inputs": { "a": "-5", "b": "1", "denominator": "2" },
+      "expected": { "ok": "-2" }
+    },
+    {
+      "id": "mul_div-half-even-negative-up",
+      "asset_precision": 7,
+      "operation": "mul_div",
+      "inputs": { "a": "-7", "b": "1", "denominator": "2" },
+      "expected": { "ok": "-4" }
+    },
+    {
+      "id": "mul_div-division-by-zero",
+      "asset_precision": 7,
+      "operation": "mul_div",
+      "inputs": { "a": "1", "b": "1", "denominator": "0" },
+      "expected": { "error": "ERR_DIVISION_BY_ZERO" }
+    },
+    {
+      "id": "mul_div-overflow",
+      "asset_precision": 7,
+      "operation": "mul_div",
+      "inputs": {
+        "a": "170141183460469231731687303715884105727",
+        "b": "2",
+        "denominator": "1"
+      },
+      "expected": { "error": "ERR_OVERFLOW" }
+    },
+    {
+      "id": "mul_div-max",
+      "asset_precision": 7,
+      "operation": "mul_div",
+      "inputs": {
+        "a": "170141183460469231731687303715884105727",
+        "b": "1",
+        "denominator": "1"
+      },
+      "expected": { "ok": "170141183460469231731687303715884105727" }
+    }
+  ]
+}
