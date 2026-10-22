@@ -267,7 +267,6 @@ export async function downloadSubjectAccessExport(
 }
 
 export async function processSubjectAccessExportJobs(): Promise<void> {
-  await expireSubjectAccessExports();
   await query(
     `WITH recovered AS (
        UPDATE subject_access_exports
@@ -348,21 +347,36 @@ export async function processSubjectAccessExportJobs(): Promise<void> {
   }
 }
 
-export async function expireSubjectAccessExports(): Promise<void> {
-  await withTransaction(async (client) => {
+export async function expireSubjectAccessExports(limit = 100): Promise<number> {
+  return withTransaction(async (client) => {
     const expired = await client.query(
-      `UPDATE subject_access_exports
-       SET status = 'expired', export_data = NULL
-       WHERE expires_at <= CURRENT_TIMESTAMP AND status <> 'expired'
-       RETURNING id, subject_public_key`,
+      `WITH candidates AS (
+         SELECT e.id
+         FROM subject_access_exports e
+         WHERE e.expires_at <= CURRENT_TIMESTAMP AND e.status <> 'expired'
+           AND NOT EXISTS (
+             SELECT 1 FROM retention_legal_holds h
+             WHERE h.data_class = 'subject_access_exports' AND h.record_id = e.id::text
+               AND h.released_at IS NULL
+           )
+         ORDER BY e.expires_at, e.id
+         LIMIT $1
+         FOR UPDATE OF e SKIP LOCKED
+       ), expired AS (
+         UPDATE subject_access_exports e
+         SET status = 'expired', export_data = NULL
+         FROM candidates c
+         WHERE e.id = c.id
+         RETURNING e.id, e.subject_public_key
+       ), audits AS (
+         INSERT INTO subject_access_export_audit (export_id, subject_public_key, action)
+         SELECT id, subject_public_key, 'expired' FROM expired
+         RETURNING id
+       )
+       SELECT COUNT(*)::integer AS count FROM expired`,
+      [limit],
     );
-    for (const row of expired.rows as Array<{ id: string; subject_public_key: string }>) {
-      await client.query(
-        `INSERT INTO subject_access_export_audit (export_id, subject_public_key, action)
-         VALUES ($1, $2, 'expired')`,
-        [row.id, row.subject_public_key],
-      );
-    }
+    return Number((expired.rows[0] as { count?: number } | undefined)?.count ?? 0);
   });
 }
 

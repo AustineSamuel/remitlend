@@ -76,6 +76,20 @@ export const notificationDeliveryLagHistogram = new client.Histogram({
   registers: [metricsRegistry],
 });
 
+export const retentionRowsProcessedCounter = new client.Counter({
+  name: 'retention_rows_processed_total',
+  help: 'Rows anonymized, expired, soft-deleted, or deleted by retention data class and operation.',
+  labelNames: ['data_class', 'operation'] as const,
+  registers: [metricsRegistry],
+});
+
+export const retentionJobRunsCounter = new client.Counter({
+  name: 'retention_job_runs_total',
+  help: 'Retention job runs by bounded outcome.',
+  labelNames: ['outcome'] as const,
+  registers: [metricsRegistry],
+});
+
 export const scoreReconciliationLastRunTimestampGauge = new client.Gauge({
   name: 'score_reconciliation_last_run_timestamp',
   help: 'Unix timestamp in seconds for the last score reconciliation run.',

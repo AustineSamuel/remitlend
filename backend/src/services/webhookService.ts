@@ -730,16 +730,17 @@ export class WebhookService {
   async deleteSubscription(id: number, ownerPublicKey: string): Promise<boolean> {
     return withTransaction(async (client) => {
       const selected = await client.query(
-        `SELECT callback_url, event_types
+        `SELECT callback_url, event_types, canceled_at
          FROM webhook_subscriptions
          WHERE id = $1 AND owner_public_key = $2
          FOR UPDATE`,
         [id, ownerPublicKey],
       );
       const current = selected.rows[0] as
-        | { callback_url: string; event_types: WebhookEventType[] }
+        | { callback_url: string; event_types: WebhookEventType[]; canceled_at: Date | null }
         | undefined;
       if (!current) return false;
+      if (current.canceled_at) return true;
 
       await client.query(
         `INSERT INTO webhook_subscription_audit
@@ -749,9 +750,15 @@ export class WebhookService {
         [id, ownerPublicKey, current.callback_url, JSON.stringify(current.event_types)],
       );
       await client.query(
-        `DELETE FROM webhook_subscriptions
+        `UPDATE webhook_subscriptions
+         SET is_active = false, canceled_at = COALESCE(canceled_at, CURRENT_TIMESTAMP),
+             secret = NULL, updated_at = CURRENT_TIMESTAMP
          WHERE id = $1 AND owner_public_key = $2`,
         [id, ownerPublicKey],
+      );
+      await client.query(
+        `DELETE FROM webhook_subscription_keys WHERE subscription_id = $1`,
+        [id],
       );
       return true;
     });

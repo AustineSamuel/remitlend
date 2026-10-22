@@ -44,18 +44,20 @@ off-chain infrastructure managed outside this repository.
 | Table | Classification | Retention Period | Deletion Trigger | Deletion Mechanism | Notes |
 |---|---|---|---|---|---|
 | `users` / `user_profiles` | PII + Credential | Active account + **3 years** after last activity | Account deletion request (borrower or admin) | Hard delete of PII columns; row kept for FK integrity with `NULL` placeholders | Name, email, phone → hard-deleted. Public key remains (pseudonymous). |
-| `scores` | Financial | **5 years** after loan closure | Loan closure + retention window expiry | Hard delete | Required for regulatory credit-history audit trails. |
-| `loan_events` | Financial | **7 years** after event timestamp | Retention window expiry | Soft-delete flag, then hard delete after 90-day grace | Legal minimum for financial records in most jurisdictions. |
-| `remittances` | PII + Financial | **5 years** after transfer date | Retention window expiry | PII columns zeroed/NULL'd; row retained for financial audit | Recipient name/phone/email cleared; amount and date kept. |
-| `audit_logs` | Operational | **7 years** | System schedule | Hard delete | Tamper-evidence: rows are append-only; no updates permitted. |
-| `notifications` | Operational | **90 days** after delivery | Cron job (daily) | Hard delete | See `notificationCleanup` in `backend/src/cron/`. |
-| `webhook_subscriptions` | Operational | Until cancelled + **30 days** | Subscriber cancellation or lender/admin action | Hard delete | Webhook secrets zeroed at cancellation. |
-| `webhook_delivery_logs` / `webhook_events` | Operational | **90 days** | Cron job (daily) | Hard delete | Delivery logs required for debugging circuit-breaker events. |
-| `loan_disputes` | Financial | **7 years** after resolution | Retention window expiry | Hard delete after grace period | Dispute outcome is also mirrored in `audit_logs`. |
-| `quarantine_events` | Operational | **90 days** | Cron job | Hard delete | Quarantine events are cleared after investigation window. |
-| `transaction_submissions` | Financial | **2 years** | Retention window expiry | Hard delete | XDR blobs can be large; compress before archiving. |
+| `scores` | Financial | **5 years** after the latest loan closure | All loans closed + retention window expiry | Hard delete | The borrower score is deleted only when at least one loan exists and every loan is in a terminal state. |
+| `subject_access_exports` | PII | **24 hours** | Export expiration | Clear generated JSON archive; retain job/audit metadata | Expired archives are not downloadable and held archives stay inaccessible while held. |
+| `contract_events` (`loan_events` compatibility view) | Financial | **7 years** after event timestamp | Retention window expiry | Soft-delete flag, then hard delete after 90-day grace | The active table is `contract_events`; legal holds use this class name. |
+| `remittances` | PII + Financial | **5 years** after transfer date | Retention window expiry | Recipient address, memo, XDR, and error text cleared; financial row retained | Borrower loan caches are invalidated through a retryable outbox. |
+| `remittance_history` | Financial, derived | **5 years** after record timestamp | Retention window expiry | Hard delete | Derived remittance history follows the five-year remittance lineage. |
+| `audit_logs` | Operational | **7 years** | System schedule | Hard delete | Retention execution evidence and legal-hold audits are stored separately. |
+| `notifications` and delivery attempts | Operational | **90 days** after delivery (creation time fallback) | Scheduled job | Hard delete | Pending delivery attempts are not removed; delivery attempts cascade with the notification. |
+| `webhook_subscriptions` | Operational | Until cancelled + **30 days** | Subscriber cancellation or lender/admin action | Deactivate immediately, clear legacy secret and key material, then hard delete | Subscription deletion waits for its delivery records to reach their 90-day retention boundary. |
+| `webhook_deliveries` | Operational | **90 days** | Scheduled job | Hard delete | Active retry records are retained until they are no longer scheduled. |
+| `loan_disputes` | Financial | **7 years** after resolution | Retention window expiry | Hard delete | Open disputes are retained. |
+| `quarantine_events` | Operational | **90 days** | Scheduled job | Hard delete | Quarantine events are cleared after investigation window. |
+| `transaction_submissions` | Financial | **2 years** | Retention window expiry | Hard delete | XDR blobs are removed with the submission record. |
 | `contract_verification` | Operational | **Indefinite** | Manual operator decision | Archive to cold storage | Contract verification records are permanent for auditability. |
-| `indexer_state` / `ledger_checkpoints` | Operational | Rolling **30 days** (latest checkpoint kept) | Cron job | Hard delete of old checkpoints | Latest checkpoint is never deleted automatically. |
+| `indexer_state` / `ledger_checkpoints` | Operational | Rolling **30 days** (latest checkpoint kept) | Scheduled job | Hard delete of old checkpoints | Latest checkpoint per contract is never deleted automatically. |
 | `pause_state` | Operational | Until contract resumed + **30 days** | Manual operator review | Hard delete | Record of emergency pauses kept for post-mortem. |
 
 ### 3.2 On-Chain Data (Stellar / Soroban)
@@ -130,6 +132,52 @@ All automated deletion jobs must:
 - Be idempotent — re-running produces no error and no additional deletions if
   the window has not advanced.
 - Be tested with the existing Jest test suite (see [Authorization Matrix Tests](authorization-matrix-tests.md)).
+- Process at most 100 eligible rows per data class and run, ordered by retention
+  timestamp and stable primary key. Re-running selects the next eligible rows;
+  operations are idempotent and persisted per-class run counts act as
+  checkpoints.
+- Exclude only exact records with an active, audited legal hold. Holds require a
+  documented basis and an audited basis when released.
+- Emit aggregate counts by data class and operation. Subject identifiers must
+  not be used as metric labels or in job logs.
+
+The scheduled implementation is `backend/src/services/dataRetentionService.ts`.
+It records per-run and per-class cutoffs, operation counts, status, and bounded
+error codes in `retention_job_runs` and `retention_job_run_classes`. Operators
+can inspect the latest runs through the admin retention API. The first run is
+started at service startup; subsequent runs occur daily. A database lease
+prevents overlapping instances, and an expired lease permits restart after a
+process interruption. Each completed class also emits a `retention_purge`
+structured log without record or subject identifiers.
+
+Active legal holds can be created and released through the admin-only
+`/api/admin/retention/legal-holds` endpoints. Both actions require a basis and
+record the acting administrator. A hold identifies one data class and one
+primary-key value; it does not suspend deletion for other records or categories.
+The release endpoint requires a separate release basis.
+
+The export job worker does not perform bulk expiration. The retention job
+clears expired `export_data` in batches and preserves the export audit record.
+The remittance anonymization job writes a retryable cache-invalidation outbox
+before committing the update, so borrower-loan cache keys are retried after
+Redis failures or process restarts.
+
+### Enforcement boundaries
+
+Some matrix entries cannot be safely automated from the current schema and are
+not guessed by the job:
+
+- Profile/account deletion after inactivity is not scheduled because
+  `user_profiles` has no reliable last-activity timestamp or account-deletion
+  state. Profile changes alone are not a safe proxy for account activity.
+- Webhook subscription cancellation now records `canceled_at`; existing
+  inactive rows created before this field remain until an explicit cancellation
+  operation sets it.
+- Score retention uses the latest terminal closure in `loan_history`; a score
+  with no loan history or any nonterminal/unknown loan state is retained.
+- Immutable on-chain data, contract verification records, indexer state, and
+  pause state are not deleted by the job. Only rolling `ledger_checkpoints`
+  are eligible under the 30-day policy.
 
 ### 4.3 Emergency / Incident-Driven Deletion
 
@@ -154,21 +202,22 @@ ingestion of SSNs or passport numbers):
 | FinCEN / AML | Financial records | 5 years | Deletion blocked during this window |
 | Stellar network | On-chain history | Indefinite (network-level) | Not deletable by RemitLend |
 
-> **Note:** RemitLend does not currently implement automated regulatory
-> retention enforcement.  The periods in this matrix are the _policy target_;
-> operators must configure cron jobs and lifecycle rules to enforce them.
+> **Note:** Retention periods are operational policy and must be reviewed for
+> applicable jurisdictions. The automated job implements only the database
+> classes listed in the enforcement section above; external backups, logs,
+> on-chain state, and infrastructure-managed artifacts use their own lifecycle
+> controls.
 
 ---
 
 ## 6. Rollout and Verification
 
-1. **No schema changes** are required by this document.  The matrix documents
-   existing table layouts.
-2. Operators deploying to production should review the matrix against their
-   jurisdiction's requirements and adjust cron retention windows in
-   `backend/src/cron/` accordingly.
-3. The [Authorization Matrix Tests](authorization-matrix-tests.md) test suite
-   verifies that the deletion procedures cannot be triggered by unprivileged
+1. Apply the retention migration before starting a new backend version.
+2. Review the matrix and legal-hold process for the deployment jurisdiction.
+3. Verify the retention admin API is reachable only by current admin JWTs and
+   monitor `retention_job_runs` for `partial` or `failed` outcomes.
+4. The [Authorization Matrix Tests](authorization-matrix-tests.md) test suite
+   verifies that administrative routes cannot be triggered by unprivileged
    roles.
 
 ---

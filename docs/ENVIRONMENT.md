@@ -102,8 +102,8 @@ stricter rate limit (10 requests/minute/IP) to prevent abuse.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | ✓ | ✓ | ✓ | — | Base URL of an OTLP/HTTP collector (Jaeger, Tempo, OTel Collector). Unset disables trace export. Spans are exported through Sentry's OpenTelemetry provider. | `backend/src/config/tracing.ts` |
 | `OTEL_SERVICE_NAME` | ✓ | ✓ | ✓ | — | `service.name` reported on exported spans | `backend/src/config/tracing.ts` |
 | `OTEL_TRACES_SAMPLE_RATE` | ✓ | ✓ | ✓ | `0.2` (prod) / `1` (other) | Fraction of traces sampled (0..1); invalid values fall back to the default | `backend/src/config/tracing.ts` |
-| `NOTIFICATION_RETENTION_DAYS` | ✓ | ✓ | ✓ | `90` | Days to keep unread notifications | `backend/src/services/notificationService.ts` |
-| `READ_NOTIFICATION_RETENTION_DAYS` | ✓ | ✓ | ✓ | `30` | Days to keep read notifications | `backend/src/services/notificationService.ts` |
+| `NOTIFICATION_RETENTION_DAYS` | ✓ | ✓ | ✓ | `90` | Legacy setting; scheduled retention uses the approved 90-day matrix policy | `backend/src/config/envSchema.ts` |
+| `READ_NOTIFICATION_RETENTION_DAYS` | ✓ | ✓ | ✓ | `30` | Legacy setting; scheduled retention uses the approved 90-day matrix policy for all notifications | `backend/src/config/envSchema.ts` |
 | `SENDGRID_API_KEY` | — | ✓ | ✓ | — | SendGrid API key for email | `backend/src/services/emailService.ts` |
 | `FROM_EMAIL` | — | ✓ | ✓ | — | Sender email address | `backend/src/services/emailService.ts` |
 | `ADMIN_EMAIL` | — | ✓ | ✓ | — | Admin notification email | `backend/src/services/notificationService.ts` |

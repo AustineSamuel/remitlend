@@ -132,6 +132,19 @@ class CacheService {
     }
   }
 
+  async deleteForRetention(key: string): Promise<boolean> {
+    try {
+      await this.ensureConnected();
+      await this.client!.del(key);
+      return true;
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'test') {
+        logger.withContext().error('Retention cache invalidation failed', { error });
+      }
+      return false;
+    }
+  }
+
   private static readonly COMPARE_AND_DELETE_SCRIPT = `
 local stored = redis.call('GET', KEYS[1])
 if stored == false then

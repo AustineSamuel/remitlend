@@ -115,22 +115,22 @@ describe('subject access export service', () => {
     );
   });
 
-  it('expires jobs, deletes their stored archive, and records expiration', async () => {
-    mockClientQuery.mockImplementation(async (text) => ({
-      rows: text.includes('RETURNING id, subject_public_key')
-        ? [{ id: 'expired-job', subject_public_key: 'GBSUBJECT' }]
-        : [],
-    }));
+  it('expires a bounded batch of jobs, clears archive content, and respects exact legal holds', async () => {
+    mockClientQuery.mockImplementation(async (text) => {
+      if (text.includes('SELECT COUNT(*)::integer AS count FROM expired')) {
+        return { rows: [{ count: 3 }] };
+      }
+      return { rows: [] };
+    });
 
-    await expireSubjectAccessExports();
+    await expect(expireSubjectAccessExports(25)).resolves.toBe(3);
 
     expect(mockClientQuery).toHaveBeenCalledWith(
-      expect.stringContaining('SET status = \'expired\', export_data = NULL'),
-      [],
+      expect.stringContaining("SET status = 'expired', export_data = NULL"),
+      [25],
     );
-    expect(mockClientQuery).toHaveBeenCalledWith(
-      expect.stringContaining("'expired'"),
-      ['expired-job', 'GBSUBJECT'],
-    );
+    expect(mockClientQuery.mock.calls[0]?.[0]).toContain('retention_legal_holds');
+    expect(mockClientQuery.mock.calls[0]?.[0]).toContain('FOR UPDATE OF e SKIP LOCKED');
+    expect(mockClientQuery.mock.calls[0]?.[0]).toContain("'expired'");
   });
 });

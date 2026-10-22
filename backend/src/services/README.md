@@ -38,7 +38,7 @@ Several services run as background jobs that are started in `index.ts` when the 
 - **Default Checker**: Interval (configurable via `DEFAULT_CHECK_INTERVAL_MS`, default 30m)
 - **Webhook Retry Scheduler**: Fixed 60s interval
 - **Score Reconciliation**: Interval (configurable via `SCORE_RECONCILIATION_INTERVAL_MS`, default 1h)
-- **Notification Cleanup**: Fixed 24h interval (retention controlled by `NOTIFICATION_RETENTION_DAYS`, `READ_NOTIFICATION_RETENTION_DAYS`)
+- **Data Retention**: Fixed daily run with per-class database checkpoints and bounded batches; see [the retention matrix](../../../docs/security/data-retention-matrix.md)
 - **Loan Due Check**: Cron `0 * * * *` (top of every hour)
 
 See the [Background Jobs table in the original README](#background-jobs) for full details on env vars and behavior.
@@ -55,7 +55,6 @@ Services read configuration from `.env`. Key variables:
 - `INDEXER_POLL_INTERVAL_MS`, `INDEXER_BATCH_SIZE`: Event indexer tuning
 - `DEFAULT_CHECK_INTERVAL_MS`: Default checker frequency
 - `SCORE_RECONCILIATION_INTERVAL_MS`: Reconciliation frequency
-- `NOTIFICATION_RETENTION_DAYS`, `READ_NOTIFICATION_RETENTION_DAYS`: Notification cleanup
 
 Refer to `backend/.env.example` for the full list.
 
@@ -496,7 +495,7 @@ The backend runs several scheduled background jobs to maintain system integrity 
 | **Default Checker**         | Interval         | `DEFAULT_CHECK_INTERVAL_MS`                                       | 1800000ms (30m)   | Calls on-chain `check_defaults` batch for overdue loans                             | `services/defaultChecker.ts`             |
 | **Webhook Retry Scheduler** | Fixed 60s        | —                                                                 | 60s               | Retries failed webhook deliveries using exponential backoff                         | `services/webhookRetryScheduler.ts`      |
 | **Score Reconciliation**    | Interval         | `SCORE_RECONCILIATION_INTERVAL_MS`                                | 3600000ms (1h)    | Compares database scores vs on-chain scores and optionally auto-corrects divergence | `services/scoreReconciliationService.ts` |
-| **Notification Cleanup**    | Fixed 24h        | `NOTIFICATION_RETENTION_DAYS`, `READ_NOTIFICATION_RETENTION_DAYS` | 24h               | Deletes old read/unread notifications per retention policy                          | `services/notificationService.ts`        |
+| **Data Retention**           | Fixed 24h        | —                                                                 | 24h               | Enforces database retention policies with audited legal holds, checkpoints, and cache/export cleanup | `services/dataRetentionService.ts`        |
 | **Loan Due Check**          | Cron `0 * * * *` | —                                                                 | Top of every hour | Notifies borrowers about upcoming loan repayments                                   | `cron/loanCheckCron.ts`                  |
 
 ### Jobs Defined But Not Wired

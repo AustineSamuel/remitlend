@@ -22,11 +22,13 @@ import {
 } from './services/webhookRetryProcessor.js';
 import { eventStreamService } from './services/eventStreamService.js';
 import {
-  startNotificationCleanupScheduler,
-  stopNotificationCleanupScheduler,
   startNotificationDeliveryProcessor,
   stopNotificationDeliveryProcessor,
 } from './services/notificationService.js';
+import {
+  startDataRetentionScheduler,
+  stopDataRetentionScheduler,
+} from './services/dataRetentionService.js';
 import {
   startScoreReconciliationScheduler,
   stopScoreReconciliationScheduler,
@@ -113,8 +115,8 @@ const server = app.listen(port, () => {
   // Start cross-contract (disbursement <-> score) reconciliation ledger sweep
   startCrossContractReconciler();
 
-  // Start periodic notification cleanup
-  startNotificationCleanupScheduler();
+  // Enforce the approved data-retention matrix in bounded, checkpointed batches.
+  startDataRetentionScheduler();
   startNotificationDeliveryProcessor();
 
   startSubjectAccessExportProcessor();
@@ -176,7 +178,7 @@ const shutdown = async (signal: 'SIGTERM' | 'SIGINT') => {
     stopSorobanWriteReplayProcessor();
     stopScoreReconciliationScheduler();
     stopCrossContractReconciler();
-    stopNotificationCleanupScheduler();
+    stopDataRetentionScheduler();
     stopNotificationDeliveryProcessor();
     stopSubjectAccessExportProcessor();
     logger.info('All schedulers stopped.');
