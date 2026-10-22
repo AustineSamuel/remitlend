@@ -14,6 +14,7 @@ subscribe, receive, and verify webhook deliveries.
 - [Delivery & Retry Semantics](#delivery--retry-semantics)
 - [Circuit Breaker](#circuit-breaker)
 - [Verifying HMAC Signatures](#verifying-hmac-signatures)
+- [Signing-Key Rotation](#signing-key-rotation)
 - [Subscriber Response Requirements](#subscriber-response-requirements)
 
 ---
@@ -55,13 +56,18 @@ Authorization: Bearer <your-jwt-token>
       "callbackUrl": "https://your-service.com/webhooks/remitlend",
       "eventTypes": ["LoanApproved", "LoanRepaid", "LoanDefaulted"],
       "isActive": true
+    },
+    "signingKey": {
+      "keyId": "e4b14dbb-1985-4a9e-8c50-e75019b29007",
+      "secret": "one-time-generated-or-provided-secret"
     }
   }
 }
 ```
 
-After creation the subscription is immediately active. No verification handshake
-is required.
+The `signingKey.secret` is disclosed only in the creation response. Store it
+securely; it is encrypted at rest and is never included in list, update, audit,
+or delivery-history responses.
 
 ### Managing Subscriptions
 
@@ -71,12 +77,82 @@ is required.
 | PUT    | `/api/indexer/webhooks/:id`       | Update an owned subscription's URL or event filters |
 | GET    | `/api/indexer/webhooks/:id/audit` | Read an owned subscription's append-only change history |
 | DELETE | `/api/indexer/webhooks/:id`       | Delete an owned subscription |
+| POST   | `/api/indexer/webhooks/:id/rotate-key` | Stage a new signing key |
+| POST   | `/api/indexer/webhooks/:id/activate-key` | Start signing with a staged key |
+| POST   | `/api/indexer/webhooks/:id/rollback-key` | Discard a staged key before activation |
 
 Subscriptions are isolated by the wallet in the bearer token; knowing another
 subscription's ID does not grant access. Endpoints must use HTTPS on port 443
 and resolve exclusively to public IP addresses. Each delivery re-resolves and
 validates DNS, connects to the validated address directly, and does not follow
 redirects. Legacy subscriptions without an owner are not sent events.
+
+## Signing-Key Rotation
+
+Rotation is a staged, owner-authorized operation. Deliveries keep using the
+current key until activation; after activation every delivery uses exactly one
+key and identifies it with `X-RemitLend-Key-Id`. The old key remains in the
+bounded overlap until the receiver confirms the new key or the overlap expires.
+
+The maximum overlap defaults to 24 hours and is configured by
+`WEBHOOK_MAX_KEY_OVERLAP_SECONDS`. The owner may request a shorter duration, but
+not a duration longer than the configured maximum.
+
+### Consumer migration
+
+1. Stage a replacement key. Send a unique `Idempotency-Key` (8–128 characters)
+   on the rotation request. Keep the current key enabled while staging:
+
+   ```http
+   POST /api/indexer/webhooks/123/rotate-key
+   Authorization: Bearer <owner-token>
+   Idempotency-Key: rotate-2026-10-22-01
+   Content-Type: application/json
+
+   {"overlapSeconds": 3600}
+   ```
+
+   Save the returned `signingKey.secret` immediately. It is returned only in
+   the first response for that idempotency key; a replay returns key metadata,
+   not the secret.
+2. Deploy the receiver so it can verify both its current key and the staged
+   key. Dispatch still signs with the current key before activation.
+3. Activate the staged key using its `keyId`:
+
+   ```http
+   POST /api/indexer/webhooks/123/activate-key
+   Authorization: Bearer <owner-token>
+   Content-Type: application/json
+
+   {"keyId":"<staged-key-id>"}
+   ```
+
+   After activation, deliveries use only the new key. The response includes
+   `overlapExpiresAt` when a previous key exists.
+4. After validating a delivery signed with the new key, return a 2xx response
+   with `X-RemitLend-Key-Verified: <keyId>`. RemitLend then retires the previous
+   key. If the receiver does not confirm, it must stop accepting the previous
+   key by `overlapExpiresAt`; RemitLend also retires it when that deadline is
+   reached.
+5. If the staged key has not been activated and the migration must be
+   abandoned, call `POST /api/indexer/webhooks/123/rollback-key` with
+   `{"keyId":"<staged-key-id>"}`. Rollback is unavailable after activation.
+
+Verify signatures over the raw request body and select the secret by
+`X-RemitLend-Key-Id`. Do not try every secret indiscriminately; key IDs allow
+the receiver to verify with exactly the intended version.
+
+### Compromise response
+
+If a signing secret may have leaked, treat it as compromised: restrict access
+to the owner credentials and secret stores, stage a replacement with the
+shortest practical overlap, deploy the new receiver secret, and activate it
+immediately. Confirm the first valid new-key delivery with the response header
+above and remove the compromised key from the receiver's accepted keys. If the
+receiver cannot be updated safely, delete the subscription to stop deliveries
+and create a replacement subscription with a new secret. Review delivery and
+subscription audit history, and rotate any owner credentials exposed alongside
+the webhook secret.
 
 ---
 
@@ -317,6 +393,9 @@ While deactivated:
 Each delivery includes an `X-RemitLend-Signature` header containing an
 HMAC-SHA256 signature of the **raw request body**.
 
+Each signed delivery also includes `X-RemitLend-Key-Id`, the identifier of the
+single key used to produce that signature.
+
 **Header format:**
 ```
 X-RemitLend-Signature: sha256=<hex-encoded-hmac>
@@ -350,13 +429,13 @@ function verifyWebhookSignature(
 > constant-time comparison) when verifying the signature to prevent timing
 > attacks.
 
-### Obtaining your secret
+### Selecting the key
 
-The signing secret is the **per-subscription secret** returned in the
-response when you register the webhook subscription (see
-[Creating a Subscription](#creating-a-subscription)). It is **not** a
-global environment variable. Store it securely on your server and use it
-to verify each incoming delivery.
+The signing secret is disclosed in the response when you register the webhook
+subscription (see [Creating a Subscription](#creating-a-subscription)) and
+only once for each rotation. Store secrets securely on your server and use
+`X-RemitLend-Key-Id` to select the one key for a delivery. List and update
+responses never contain secret material.
 
 See also: [docs/wiki/webhook-signatures.md](wiki/webhook-signatures.md)
 for additional language examples.
@@ -374,6 +453,9 @@ for additional language examples.
 
 - **Respond within 10 seconds.** Slow responses are counted as failures.
 - Returning any 2xx status (200, 201, 202, 204) acknowledges delivery.
+- After verifying a delivery with the new key, include
+  `X-RemitLend-Key-Verified: <keyId>` in the 2xx response to retire the prior
+  key immediately.
 
 ---
 

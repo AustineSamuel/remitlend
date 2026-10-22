@@ -24,6 +24,13 @@ import {
 } from '../utils/pagination.js';
 import { parseCappedLimit } from '../utils/queryHelpers.js';
 import logger from '../utils/logger.js';
+import {
+  activateWebhookSigningKey,
+  getMaxWebhookKeyOverlapSeconds,
+  rollbackWebhookSigningKey,
+  rotateWebhookSigningKey,
+  WebhookKeyRotationError,
+} from '../services/webhookKeyRotationService.js';
 
 import { getStellarRpcUrl } from '../config/stellar.js';
 
@@ -667,7 +674,7 @@ export const createWebhookSubscription = async (req: Request, res: Response) => 
       });
     }
 
-    const subscription = await webhookService.registerSubscription(
+    const registered = await webhookService.registerSubscription(
       ownerPublicKey,
       secret
         ? {
@@ -684,7 +691,8 @@ export const createWebhookSubscription = async (req: Request, res: Response) => 
     return res.status(201).json({
       success: true,
       data: {
-        subscription,
+        subscription: registered.subscription,
+        signingKey: registered.signingKey,
       },
     });
   } catch (error) {
@@ -692,6 +700,155 @@ export const createWebhookSubscription = async (req: Request, res: Response) => 
     return res.status(500).json({
       success: false,
       message: 'Failed to create webhook subscription',
+    });
+  }
+};
+
+export const rotateWebhookSubscriptionKey = async (req: Request, res: Response) => {
+  try {
+    const ownerPublicKey = req.user?.publicKey;
+    if (!ownerPublicKey) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+
+    const subscriptionId = Number(req.params.id ?? req.params.subscriptionId);
+    if (!Number.isInteger(subscriptionId) || subscriptionId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'subscriptionId must be a positive integer',
+      });
+    }
+
+    const idempotencyKey = req.get('Idempotency-Key');
+    if (!idempotencyKey || idempotencyKey.length < 8 || idempotencyKey.length > 128) {
+      return res.status(400).json({
+        success: false,
+        message: 'Idempotency-Key header must contain between 8 and 128 characters',
+      });
+    }
+
+    const body = req.body as { overlapSeconds?: unknown };
+    if (
+      body.overlapSeconds !== undefined &&
+      (!Number.isSafeInteger(body.overlapSeconds) || Number(body.overlapSeconds) < 1)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'overlapSeconds must be a positive integer',
+      });
+    }
+
+    const result = await rotateWebhookSigningKey(
+      subscriptionId,
+      ownerPublicKey,
+      idempotencyKey,
+      body.overlapSeconds === undefined
+        ? getMaxWebhookKeyOverlapSeconds()
+        : Number(body.overlapSeconds),
+    );
+    return res.status(result.replayed ? 200 : 201).json({
+      success: true,
+      data: {
+        signingKey: {
+          keyId: result.keyId,
+          ...(result.secret ? { secret: result.secret } : {}),
+          ...(result.overlapExpiresAt
+            ? { overlapExpiresAt: result.overlapExpiresAt.toISOString() }
+            : {}),
+        },
+        replayed: result.replayed,
+      },
+    });
+  } catch (error) {
+    if (error instanceof WebhookKeyRotationError) {
+      if (error.code === 'not_found') {
+        return res.status(404).json({ success: false, message: error.message });
+      }
+      if (error.code === 'overlap_in_progress') {
+        return res.status(409).json({ success: false, message: error.message });
+      }
+      if (error.code === 'invalid_overlap') {
+        return res.status(400).json({ success: false, message: error.message });
+      }
+      if (error.code === 'not_pending') {
+        return res.status(409).json({ success: false, message: error.message });
+      }
+    }
+    logger.withContext().error('Failed to rotate webhook signing key', { error });
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to rotate webhook signing key',
+    });
+  }
+};
+
+export const activateWebhookSubscriptionKey = async (req: Request, res: Response) => {
+  try {
+    const ownerPublicKey = req.user?.publicKey;
+    if (!ownerPublicKey) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+    const subscriptionId = Number(req.params.id ?? req.params.subscriptionId);
+    const { keyId } = req.body as { keyId?: unknown };
+    if (!Number.isInteger(subscriptionId) || subscriptionId <= 0) {
+      return res.status(400).json({ success: false, message: 'subscriptionId must be positive' });
+    }
+    if (typeof keyId !== 'string') {
+      return res.status(400).json({ success: false, message: 'keyId must be a string' });
+    }
+
+    const result = await activateWebhookSigningKey(subscriptionId, ownerPublicKey, keyId);
+    return res.json({
+      success: true,
+      data: {
+        keyId: result.keyId,
+        ...(result.overlapExpiresAt
+          ? { overlapExpiresAt: result.overlapExpiresAt.toISOString() }
+          : {}),
+        replayed: result.replayed,
+      },
+    });
+  } catch (error) {
+    if (error instanceof WebhookKeyRotationError) {
+      return res
+        .status(error.code === 'not_found' ? 404 : 409)
+        .json({ success: false, message: error.message });
+    }
+    logger.withContext().error('Failed to activate webhook signing key', { error });
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to activate webhook signing key',
+    });
+  }
+};
+
+export const rollbackWebhookSubscriptionKey = async (req: Request, res: Response) => {
+  try {
+    const ownerPublicKey = req.user?.publicKey;
+    if (!ownerPublicKey) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+    const subscriptionId = Number(req.params.id ?? req.params.subscriptionId);
+    const { keyId } = req.body as { keyId?: unknown };
+    if (!Number.isInteger(subscriptionId) || subscriptionId <= 0) {
+      return res.status(400).json({ success: false, message: 'subscriptionId must be positive' });
+    }
+    if (typeof keyId !== 'string') {
+      return res.status(400).json({ success: false, message: 'keyId must be a string' });
+    }
+
+    await rollbackWebhookSigningKey(subscriptionId, ownerPublicKey, keyId);
+    return res.status(204).send();
+  } catch (error) {
+    if (error instanceof WebhookKeyRotationError) {
+      return res
+        .status(error.code === 'not_found' ? 404 : 409)
+        .json({ success: false, message: error.message });
+    }
+    logger.withContext().error('Failed to roll back webhook signing key', { error });
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to roll back webhook signing key',
     });
   }
 };

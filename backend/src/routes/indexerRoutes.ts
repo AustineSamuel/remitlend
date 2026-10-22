@@ -7,6 +7,9 @@ import {
   getRecentEvents,
   listWebhookSubscriptions,
   createWebhookSubscription,
+  rotateWebhookSubscriptionKey,
+  activateWebhookSubscriptionKey,
+  rollbackWebhookSubscriptionKey,
   updateWebhookSubscription,
   deleteWebhookSubscription,
   getWebhookSubscriptionAudit,
@@ -262,6 +265,66 @@ router.post(
   strictRateLimiter,
   auditLog,
   createWebhookSubscription,
+);
+
+/**
+ * @swagger
+ * /indexer/webhooks/{subscriptionId}/rotate-key:
+ *   post:
+ *     summary: Rotate an owned webhook signing key
+ *     description: >
+ *       Creates a new current signing key while retaining the previous key
+ *       until the receiver confirms the new key or the bounded overlap expires.
+ *       The secret is returned only in the first successful response.
+ *     tags: [Indexer]
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: subscriptionId
+ *         required: true
+ *         schema:
+ *           type: integer
+ *       - in: header
+ *         name: Idempotency-Key
+ *         required: true
+ *         schema:
+ *           type: string
+ *           minLength: 8
+ *           maxLength: 128
+ *     responses:
+ *       201:
+ *         description: Signing key rotated; new secret is disclosed once
+ *       404:
+ *         description: Subscription not found or not owned by the caller
+ *       409:
+ *         description: A previous rotation is still in its overlap window
+ */
+router.post(
+  '/webhooks/:subscriptionId/rotate-key',
+  requireJwtAuth,
+  requireScopes('write:webhooks'),
+  strictRateLimiter,
+  auditLog,
+  rotateWebhookSubscriptionKey,
+);
+
+router.post(
+  '/webhooks/:subscriptionId/activate-key',
+  requireJwtAuth,
+  requireScopes('write:webhooks'),
+  strictRateLimiter,
+  auditLog,
+  activateWebhookSubscriptionKey,
+);
+
+router.post(
+  '/webhooks/:subscriptionId/rollback-key',
+  requireJwtAuth,
+  requireScopes('write:webhooks'),
+  strictRateLimiter,
+  auditLog,
+  rollbackWebhookSubscriptionKey,
 );
 
 /**

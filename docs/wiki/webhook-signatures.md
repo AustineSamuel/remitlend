@@ -4,6 +4,12 @@ Every outbound webhook delivery from RemitLend includes an
 `X-RemitLend-Signature` header that allows subscribers to verify the
 payload was not tampered with in transit.
 
+Signed deliveries also contain `X-RemitLend-Key-Id`. Use this identifier to
+select exactly one versioned secret for verification. During rotation, retain
+the old key only through the announced overlap window and return
+`X-RemitLend-Key-Verified: <keyId>` after successfully verifying a delivery
+with the new key.
+
 ## Header format
 
 ```
@@ -33,13 +39,15 @@ function verifySignature(secret, rawBody, signatureHeader) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// Express example — YOUR_SUBSCRIPTION_SECRET is the per-subscription
-// secret returned when you registered the webhook, not an env var.
+// Express example — select the one-time-disclosed secret by key ID.
 app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
   const sig = req.headers["x-remitlend-signature"];
-  if (!verifySignature(YOUR_SUBSCRIPTION_SECRET, req.body, sig)) {
+  const keyId = req.headers["x-remitlend-key-id"];
+  const secret = secretsByKeyId.get(keyId);
+  if (!secret || !verifySignature(secret, req.body, sig)) {
     return res.status(401).send("Invalid signature");
   }
+  res.setHeader("X-RemitLend-Key-Verified", keyId);
   // process req.body …
   res.sendStatus(200);
 });
@@ -65,5 +73,6 @@ def verify_signature(secret: str, raw_body: bytes, header: str) -> bool:
   authoritative integrity check**.
 - Always parse the raw body bytes *before* JSON-decoding; most
   frameworks let you configure a raw-body parser for webhook routes.
-- Secrets can be rotated by deleting and re-creating the subscription
-  (secret rotation via the API is tracked in a separate issue).
+- Secrets are disclosed only on subscription creation and the first successful
+  response to a rotation request. See [webhook consumer migration and
+  compromise response](../webhooks.md#signing-key-rotation).

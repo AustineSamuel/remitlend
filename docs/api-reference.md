@@ -1117,6 +1117,16 @@ GET /api/v1/loans/borrower/{borrower}?limit=20&offset=0
 
 Subscribe to events via webhooks for real-time notifications of loan approvals, repayments, and other state changes.
 
+#### POST /api/indexer/webhooks/{id}/rotate-key
+Stage a replacement signing key for an owned subscription. Requires
+`Idempotency-Key`; the new secret is returned only once.
+
+#### POST /api/indexer/webhooks/{id}/activate-key
+Switch delivery signing to a staged key. The request body contains its `keyId`.
+
+#### POST /api/indexer/webhooks/{id}/rollback-key
+Retire a staged key before activation. The request body contains its `keyId`.
+
 **Webhook Delivery Format:**
 ```json
 {
@@ -1225,4 +1235,3 @@ Contributor workflow when adding an endpoint: implement the route (with its
 `@openapi` JSDoc block if it should appear in Swagger), add the
 `#### METHOD /path` section here with a request and a response example, then run
 `npm run docs:check` (or `npm test -- apiReference`) from `backend/`.
-

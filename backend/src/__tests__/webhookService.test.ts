@@ -5,12 +5,21 @@ type MockQueryResult = { rows: unknown[]; rowCount?: number };
 const mockQuery: jest.MockedFunction<
   (text: string, params?: unknown[]) => Promise<MockQueryResult>
 > = jest.fn();
+const mockDecryptField: jest.MockedFunction<
+  (...args: unknown[]) => Promise<string>
+> = jest.fn();
 
 jest.unstable_mockModule('../db/connection.js', () => ({
   default: { query: mockQuery },
   query: mockQuery,
   getClient: jest.fn(),
   closePool: jest.fn(),
+}));
+
+jest.unstable_mockModule('../services/piiCrypto.js', () => ({
+  encryptField: jest.fn(),
+  decryptField: mockDecryptField,
+  maskValue: jest.fn(),
 }));
 
 const { WebhookService, getRetryDelayMs } = await import('../services/webhookService.js');
@@ -233,6 +242,58 @@ describe('WebhookService', () => {
       });
 
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      const options = fetchMock.mock.calls[0]![1] as RequestInit;
+      expect((options.headers as Record<string, string>)['x-remitlend-key-id']).toBe('legacy-1');
+    });
+
+    it('uses exactly the selected active key and includes its key ID', async () => {
+      const secret = 'encrypted-active-secret';
+      mockDecryptField.mockResolvedValue(secret);
+      const fetchMock =
+        jest.fn<(_url: string, opts: RequestInit) => Promise<{ ok: boolean; status: number }>>();
+      fetchMock.mockResolvedValue({ ok: true, status: 200 });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      const keyId = '2b57456a-3c74-4d8f-b563-37f193f95eea';
+      mockQuery
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              id: 1,
+              callback_url: 'https://consumer.example',
+              secret: null,
+              signing_key_id: keyId,
+              signing_key_ciphertext: Buffer.from('ciphertext'),
+              signing_key_nonce: Buffer.from('nonce'),
+              signing_key_wrapped_dek: Buffer.from('wrapped'),
+              signing_key_kek_id: 'test-kek',
+            },
+          ],
+        })
+        .mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+      const service = new WebhookService();
+      await service.dispatch({
+        eventId: 'evt-active-key',
+        eventType: 'LoanApproved',
+        ledger: 200,
+        ledgerClosedAt: new Date('2025-06-01T00:00:00.000Z'),
+        txHash: 'tx-active-key',
+        contractId: 'contract-active-key',
+        topics: [],
+        value: 'xdr',
+      });
+
+      const requestOptions = fetchMock.mock.calls[0]![1] as RequestInit;
+      const headers = requestOptions.headers as Record<string, string>;
+      expect(headers['x-remitlend-key-id']).toBe(keyId);
+      expect(headers['x-remitlend-signature']).toBe(
+        `sha256=${(await import('node:crypto'))
+          .createHmac('sha256', secret)
+          .update(requestOptions.body as string)
+          .digest('hex')}`,
+      );
+      expect(mockDecryptField).toHaveBeenCalledTimes(1);
     });
 
     it("header value starts with 'sha256=' and matches HMAC-SHA256 of the request body", async () => {

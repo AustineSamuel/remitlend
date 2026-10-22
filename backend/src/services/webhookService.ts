@@ -3,6 +3,12 @@ import { query, withTransaction } from '../db/connection.js';
 import logger from '../utils/logger.js';
 import { getOutboundTraceparent } from '../utils/requestContext.js';
 import { sendWebhookRequest } from './webhookEgress.js';
+import {
+  decryptWebhookSigningKey,
+  retirePreviousWebhookKey,
+  saveInitialWebhookKey,
+  type WebhookSigningKey,
+} from './webhookKeyRotationService.js';
 
 // #1520 — this array is the single source of truth for which event types
 // external webhook subscribers can register for. docs/webhooks.md's
@@ -101,7 +107,6 @@ export interface WebhookSubscription {
   ownerPublicKey: string;
   callbackUrl: string;
   eventTypes: WebhookEventType[];
-  secret?: string;
   isActive: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -112,6 +117,7 @@ export interface WebhookDelivery {
   subscriptionId: number;
   eventId: string;
   eventType: WebhookEventType;
+  signingKeyId?: string;
   attemptCount: number;
   lastStatusCode?: number;
   lastError?: string;
@@ -124,6 +130,11 @@ interface RegisterWebhookInput {
   callbackUrl: string;
   eventTypes: WebhookEventType[];
   secret?: string;
+}
+
+export interface RegisteredWebhookSubscription {
+  subscription: WebhookSubscription;
+  signingKey: WebhookSigningKey;
 }
 
 interface PreparedWebhookPayload {
@@ -248,7 +259,7 @@ async function postWebhook(
   callbackUrl: string,
   body: string,
   signature: string | undefined,
-  identity?: { eventId?: string; generation?: number },
+  identity?: { eventId?: string; generation?: number; signingKeyId?: string },
 ): Promise<Response> {
   const timeoutMs = getWebhookRequestTimeoutMs();
   const controller = new AbortController();
@@ -269,6 +280,7 @@ async function postWebhook(
         ...(identity?.generation !== undefined && {
           'x-remitlend-delivery-generation': String(identity.generation),
         }),
+        ...(identity?.signingKeyId && { 'x-remitlend-key-id': identity.signingKeyId }),
         // X-RemitLend-Signature uses the GitHub/Stripe-style "sha256=<hex>"
         // format so subscribers can verify payload integrity (see
         // docs/wiki/webhook-signatures.md for the verification recipe).
@@ -318,10 +330,22 @@ export class WebhookService {
     try {
       const now = new Date();
       const result = await query(
-        `SELECT id, subscription_id, callback_url, secret, event_id, event_type, 
-                payload, attempt_count, delivery_generation
+        `WITH expired_webhook_keys AS (
+           UPDATE webhook_subscription_keys
+           SET state = 'retired', retired_at = CURRENT_TIMESTAMP
+           WHERE state = 'previous' AND overlap_expires_at <= CURRENT_TIMESTAMP
+           RETURNING id
+         )
+         SELECT wd.id, wd.subscription_id, ws.callback_url, ws.secret, wd.event_id,
+                wd.event_type, wd.payload, wd.attempt_count, wd.delivery_generation,
+                sk.id AS signing_key_id, sk.ciphertext AS signing_key_ciphertext,
+                sk.gcm_nonce AS signing_key_nonce,
+                sk.dek_wrapped AS signing_key_wrapped_dek,
+                sk.dek_kek_id AS signing_key_kek_id
          FROM webhook_deliveries wd
          JOIN webhook_subscriptions ws ON wd.subscription_id = ws.id
+         LEFT JOIN webhook_subscription_keys sk
+           ON sk.subscription_id = ws.id AND sk.state = 'current'
          WHERE wd.delivered_at IS NULL
            AND wd.next_retry_at IS NOT NULL
            AND wd.next_retry_at <= $1
@@ -357,16 +381,21 @@ export class WebhookService {
         if (delivery.attempt_count >= MAX_RETRY_ATTEMPTS) {
           continue;
         }
+        const signingKey = await decryptWebhookSigningKey(
+          delivery as unknown as Record<string, unknown>,
+          delivery.event_id,
+        );
         await WebhookService.retryWebhookDelivery(
           delivery.id,
           delivery.subscription_id,
           delivery.callback_url,
-          delivery.secret || undefined,
+          signingKey?.secret,
           delivery.event_id,
           delivery.event_type as WebhookEventType,
           delivery.payload,
           delivery.attempt_count,
           Number(delivery.delivery_generation ?? 1),
+          signingKey?.keyId,
         );
       }
     } catch (error) {
@@ -384,6 +413,7 @@ export class WebhookService {
     payload: Record<string, unknown>,
     attemptCount: number,
     generation: number = 1,
+    signingKeyId?: string,
   ): Promise<void> {
     const preparedPayload = prepareWebhookPayload(payload);
     const body = preparedPayload.body;
@@ -395,7 +425,19 @@ export class WebhookService {
     let response: Response | null = null;
 
     try {
-      response = await postWebhook(callbackUrl, body, signature, { eventId, generation });
+      response = await postWebhook(callbackUrl, body, signature, {
+        eventId,
+        generation,
+        ...(signingKeyId ? { signingKeyId } : {}),
+      });
+
+      if (
+        response.ok &&
+        signingKeyId &&
+        response.headers?.get('x-remitlend-key-verified') === signingKeyId
+      ) {
+        await retirePreviousWebhookKey(subscriptionId, signingKeyId);
+      }
 
       const successful = response.ok;
       const newAttemptCount = attemptCount + 1;
@@ -409,9 +451,10 @@ export class WebhookService {
                delivered_at = $3,
                last_error = NULL,
                next_retry_at = NULL,
-               updated_at = $4
+               updated_at = $4,
+               signing_key_id = $6
            WHERE id = $5`,
-          [newAttemptCount, response.status, new Date(), new Date(), deliveryId],
+          [newAttemptCount, response.status, new Date(), new Date(), deliveryId, signingKeyId ?? null],
         );
 
         logger.withContext().info('Webhook delivery succeeded after retry', {
@@ -436,7 +479,8 @@ export class WebhookService {
                next_retry_at = $4,
                updated_at = $5,
                dead_lettered_at = $7,
-               dead_letter_reason = $8
+               dead_letter_reason = $8,
+               signing_key_id = $9
            WHERE id = $6`,
           [
             newAttemptCount,
@@ -447,6 +491,7 @@ export class WebhookService {
             deliveryId,
             nextRetryTime ? null : new Date(),
             nextRetryTime ? null : redactFailureSummary(errorMsg),
+            signingKeyId ?? null,
           ],
         );
 
@@ -486,7 +531,8 @@ export class WebhookService {
              next_retry_at = $3,
              updated_at = $4,
              dead_lettered_at = $6,
-             dead_letter_reason = $7
+             dead_letter_reason = $7,
+             signing_key_id = $8
          WHERE id = $5`,
         [
           newAttemptCount,
@@ -496,6 +542,7 @@ export class WebhookService {
           deliveryId,
           nextRetryTime ? null : new Date(),
           nextRetryTime ? null : redactFailureSummary(errorMsg),
+          signingKeyId ?? null,
         ],
       );
 
@@ -586,30 +633,36 @@ export class WebhookService {
   async registerSubscription(
     ownerPublicKey: string,
     input: RegisterWebhookInput,
-  ): Promise<WebhookSubscription> {
+  ): Promise<RegisteredWebhookSubscription> {
     return withTransaction(async (client) => {
+      const secret = input.secret ?? crypto.randomBytes(32).toString('hex');
       const result = await client.query(
         `INSERT INTO webhook_subscriptions
            (owner_public_key, callback_url, event_types, secret, is_active)
          VALUES ($1, $2, $3::jsonb, $4, true)
-         RETURNING id, owner_public_key, callback_url, event_types, secret, is_active,
+         RETURNING id, owner_public_key, callback_url, event_types, is_active,
                    created_at, updated_at`,
-        [ownerPublicKey, input.callbackUrl, JSON.stringify(input.eventTypes), input.secret ?? null],
+        [ownerPublicKey, input.callbackUrl, JSON.stringify(input.eventTypes), null],
       );
       const row = result.rows[0] as Record<string, unknown>;
+      const keyId = await saveInitialWebhookKey(client, Number(row.id), secret);
       await client.query(
         `INSERT INTO webhook_subscription_audit
-           (subscription_id, owner_public_key, change_type, callback_url, event_types)
-         VALUES ($1, $2, 'created', $3, $4::jsonb)`,
-        [row.id, ownerPublicKey, input.callbackUrl, JSON.stringify(input.eventTypes)],
+           (subscription_id, owner_public_key, change_type, callback_url, event_types,
+            signing_key_id)
+         VALUES ($1, $2, 'created', $3, $4::jsonb, $5)`,
+        [row.id, ownerPublicKey, input.callbackUrl, JSON.stringify(input.eventTypes), keyId],
       );
-      return this.mapSubscriptionRow(row);
+      return {
+        subscription: this.mapSubscriptionRow(row),
+        signingKey: { keyId, secret },
+      };
     });
   }
 
   async listSubscriptions(ownerPublicKey: string): Promise<WebhookSubscription[]> {
     const result = await query(
-      `SELECT id, owner_public_key, callback_url, event_types, secret, is_active,
+      `SELECT id, owner_public_key, callback_url, event_types, is_active,
               created_at, updated_at
        FROM webhook_subscriptions
        WHERE owner_public_key = $1
@@ -627,7 +680,7 @@ export class WebhookService {
   ): Promise<WebhookSubscription | null> {
     return withTransaction(async (client) => {
       const selected = await client.query(
-        `SELECT id, owner_public_key, callback_url, event_types, secret, is_active,
+        `SELECT id, owner_public_key, callback_url, event_types, is_active,
                 created_at, updated_at
          FROM webhook_subscriptions
          WHERE id = $1 AND owner_public_key = $2
@@ -651,7 +704,7 @@ export class WebhookService {
         `UPDATE webhook_subscriptions
          SET callback_url = $1, event_types = $2::jsonb, updated_at = CURRENT_TIMESTAMP
          WHERE id = $3 AND owner_public_key = $4
-         RETURNING id, owner_public_key, callback_url, event_types, secret, is_active,
+         RETURNING id, owner_public_key, callback_url, event_types, is_active,
                    created_at, updated_at`,
         [nextCallbackUrl, JSON.stringify(nextEventTypes), id, ownerPublicKey],
       );
@@ -710,6 +763,7 @@ export class WebhookService {
   ): Promise<Array<Record<string, unknown>>> {
     const result = await query(
       `SELECT id, subscription_id, change_type, previous_callback_url, callback_url,
+              previous_signing_key_id, signing_key_id,
               previous_event_types, event_types, created_at
        FROM webhook_subscription_audit
        WHERE subscription_id = $1 AND owner_public_key = $2
@@ -725,7 +779,8 @@ export class WebhookService {
     limit: number = 50,
   ): Promise<WebhookDelivery[]> {
     const result = await query(
-      `SELECT wd.id, wd.subscription_id, wd.event_id, wd.event_type, wd.attempt_count,
+      `SELECT wd.id, wd.subscription_id, wd.event_id, wd.event_type, wd.signing_key_id,
+              wd.attempt_count,
               wd.last_status_code, wd.last_error, wd.delivered_at, wd.created_at, wd.updated_at
        FROM webhook_deliveries wd
        JOIN webhook_subscriptions ws ON ws.id = wd.subscription_id
@@ -749,23 +804,37 @@ export class WebhookService {
     try {
       const preparedPayload = prepareWebhookPayload(event as unknown as Record<string, unknown>);
       const webhooksResult = await query(
-        `SELECT id, callback_url, secret
-         FROM webhook_subscriptions
-         WHERE is_active = true
-           AND owner_public_key IS NOT NULL
-           AND event_types @> $1::jsonb`,
+        `WITH expired_webhook_keys AS (
+           UPDATE webhook_subscription_keys
+           SET state = 'retired', retired_at = CURRENT_TIMESTAMP
+           WHERE state = 'previous' AND overlap_expires_at <= CURRENT_TIMESTAMP
+           RETURNING id
+         )
+         SELECT ws.id, ws.callback_url, ws.secret,
+                sk.id AS signing_key_id, sk.ciphertext AS signing_key_ciphertext,
+                sk.gcm_nonce AS signing_key_nonce,
+                sk.dek_wrapped AS signing_key_wrapped_dek,
+                sk.dek_kek_id AS signing_key_kek_id
+         FROM webhook_subscriptions ws
+         LEFT JOIN webhook_subscription_keys sk
+           ON sk.subscription_id = ws.id AND sk.state = 'current'
+         WHERE ws.is_active = true
+           AND ws.owner_public_key IS NOT NULL
+           AND ws.event_types @> $1::jsonb`,
         [JSON.stringify([event.eventType])],
       );
 
       await Promise.all(
-        webhooksResult.rows.map((hook) =>
-          this.sendToWebhook(
-            Number((hook as { id: number }).id),
-            String((hook as { callback_url: string }).callback_url),
-            ((hook as { secret?: string | null }).secret ?? undefined) || undefined,
+        webhooksResult.rows.map(async (rawHook) => {
+          const hook = rawHook as Record<string, unknown>;
+          const signingKey = await decryptWebhookSigningKey(hook, event.eventId);
+          await this.sendToWebhook(
+            Number(hook.id),
+            String(hook.callback_url),
+            signingKey,
             preparedPayload,
-          ),
-        ),
+          );
+        }),
       );
     } catch (error) {
       logger.withContext().error('Error during webhook dispatch', {
@@ -779,20 +848,29 @@ export class WebhookService {
   private async sendToWebhook(
     subscriptionId: number,
     callbackUrl: string,
-    secret: string | undefined,
+    signingKey: WebhookSigningKey | null,
     payload: PreparedWebhookPayload,
   ): Promise<void> {
     const body = payload.body;
 
-    const signature = secret
-      ? crypto.createHmac('sha256', secret).update(body).digest('hex')
+    const signature = signingKey
+      ? crypto.createHmac('sha256', signingKey.secret).update(body).digest('hex')
       : undefined;
 
     try {
       const response = await postWebhook(callbackUrl, body, signature, {
         eventId: String(payload.payload.eventId),
         generation: 1,
+        ...(signingKey ? { signingKeyId: signingKey.keyId } : {}),
       });
+
+      if (
+        response.ok &&
+        signingKey &&
+        response.headers?.get('x-remitlend-key-verified') === signingKey.keyId
+      ) {
+        await retirePreviousWebhookKey(subscriptionId, signingKey.keyId);
+      }
 
       const successful = response.ok;
 
@@ -807,9 +885,10 @@ export class WebhookService {
             last_status_code,
             delivered_at,
             payload,
-            next_retry_at
+            next_retry_at,
+            signing_key_id
           )
-          VALUES ($1, $2, $3, 1, $4, $5, $6::jsonb, NULL)`,
+          VALUES ($1, $2, $3, 1, $4, $5, $6::jsonb, NULL, $7)`,
           [
             subscriptionId,
             payload.payload.eventId,
@@ -817,6 +896,7 @@ export class WebhookService {
             response.status,
             new Date(),
             body,
+            signingKey?.keyId ?? null,
           ],
         );
       } else {
@@ -831,9 +911,10 @@ export class WebhookService {
             last_status_code,
             last_error,
             payload,
-            next_retry_at
+            next_retry_at,
+            signing_key_id
           )
-          VALUES ($1, $2, $3, 1, $4, $5, $6::jsonb, $7)`,
+          VALUES ($1, $2, $3, 1, $4, $5, $6::jsonb, $7, $8)`,
           [
             subscriptionId,
             payload.payload.eventId,
@@ -842,6 +923,7 @@ export class WebhookService {
             `Webhook returned status ${response.status}`,
             body,
             nextRetryAt,
+            signingKey?.keyId ?? null,
           ],
         );
 
@@ -864,9 +946,10 @@ export class WebhookService {
           attempt_count,
           last_error,
           payload,
-          next_retry_at
+          next_retry_at,
+          signing_key_id
         )
-        VALUES ($1, $2, $3, 1, $4, $5::jsonb, $6)`,
+        VALUES ($1, $2, $3, 1, $4, $5::jsonb, $6, $7)`,
         [
           subscriptionId,
           payload.payload.eventId,
@@ -874,6 +957,7 @@ export class WebhookService {
           error instanceof Error ? error.message : 'Unknown webhook error',
           body,
           nextRetryAt,
+          signingKey?.keyId ?? null,
         ],
       );
 
@@ -888,14 +972,11 @@ export class WebhookService {
   }
 
   private mapSubscriptionRow(row: Record<string, unknown>): WebhookSubscription {
-    const secret = typeof row.secret === 'string' && row.secret.length > 0 ? row.secret : undefined;
-
     return {
       id: Number(row.id),
       ownerPublicKey: String(row.owner_public_key),
       callbackUrl: String(row.callback_url),
       eventTypes: (row.event_types as WebhookEventType[]) ?? [],
-      ...(secret ? { secret } : {}),
       isActive: Boolean(row.is_active),
       createdAt: new Date(String(row.created_at)),
       updatedAt: new Date(String(row.updated_at)),
@@ -920,6 +1001,7 @@ export class WebhookService {
       subscriptionId: Number(row.subscription_id),
       eventId: String(row.event_id),
       eventType: String(row.event_type) as WebhookEventType,
+      ...(typeof row.signing_key_id === 'string' ? { signingKeyId: row.signing_key_id } : {}),
       attemptCount: Number(row.attempt_count ?? 1),
       ...(lastStatusCode !== undefined ? { lastStatusCode } : {}),
       ...(lastError ? { lastError } : {}),

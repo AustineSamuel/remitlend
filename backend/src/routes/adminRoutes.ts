@@ -9,6 +9,7 @@ import { auditLog } from '../middleware/auditLog.js';
 import { defaultChecker } from '../services/defaultChecker.js';
 import {
   createWebhookSubscription,
+  activateWebhookSubscriptionKey,
   deleteWebhookSubscription,
   getWebhookDeliveries,
   listWebhookDeadLetters,
@@ -17,6 +18,8 @@ import {
   listWebhookSubscriptions,
   reprocessQuarantinedEvents,
   reindexLedgerRange,
+  rollbackWebhookSubscriptionKey,
+  rotateWebhookSubscriptionKey,
   updateWebhookSubscription,
 } from '../controllers/indexerController.js';
 import {
@@ -402,6 +405,31 @@ router.post(
   strictRateLimiter,
   auditLog,
   createWebhookSubscription,
+);
+
+router.post(
+  '/webhooks/:id/rotate-key',
+  requireJwtAuth,
+  requireScopes('write:webhooks'),
+  strictRateLimiter,
+  auditLog,
+  rotateWebhookSubscriptionKey,
+);
+router.post(
+  '/webhooks/:id/activate-key',
+  requireJwtAuth,
+  requireScopes('write:webhooks'),
+  strictRateLimiter,
+  auditLog,
+  activateWebhookSubscriptionKey,
+);
+router.post(
+  '/webhooks/:id/rollback-key',
+  requireJwtAuth,
+  requireScopes('write:webhooks'),
+  strictRateLimiter,
+  auditLog,
+  rollbackWebhookSubscriptionKey,
 );
 
 /**

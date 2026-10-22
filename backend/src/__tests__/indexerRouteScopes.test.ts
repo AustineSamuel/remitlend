@@ -18,6 +18,9 @@ jest.unstable_mockModule('../controllers/indexerController.js', () => ({
     res.json({ success: true, data: [] }),
   ),
   createWebhookSubscription: mockCreateWebhookSubscription,
+  rotateWebhookSubscriptionKey: jest.fn(okHandler),
+  activateWebhookSubscriptionKey: jest.fn(okHandler),
+  rollbackWebhookSubscriptionKey: jest.fn(okHandler),
   deleteWebhookSubscription: jest.fn(okHandler),
 }));
 
